@@ -53,6 +53,36 @@ if hwinfo.IS_WIN:
     except Exception:
         _user32 = None
 
+# Тип курсора хоста (стрелка/текст/рука/resize/…): читаем реальный HCURSOR через
+# GetCursorInfo и сопоставляем со стандартными системными курсорами. Клиент затем
+# показывает курсор нужной формы сам — курсор НЕ впечатывается в кадр (это убирает
+# перекодирование при каждом движении мыши и делает курсор «живым» и адаптивным).
+_CURSOR_TYPE_MAP = {}
+_GetCursorInfo = None
+_CURSORINFO = None
+if _user32 is not None:
+    try:
+        class _CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("flags", ctypes.c_uint),
+                        ("hCursor", ctypes.c_void_p), ("ptScreenPos", _POINT)]
+
+        _user32.LoadCursorW.restype = ctypes.c_void_p
+        _user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        # ID стандартных курсоров Windows -> имя CSS-курсора
+        _STD_CURSORS = {
+            32512: "default", 32513: "text", 32514: "wait", 32515: "crosshair",
+            32516: "default", 32642: "nwse-resize", 32643: "nesw-resize",
+            32644: "ew-resize", 32645: "ns-resize", 32646: "move",
+            32648: "not-allowed", 32649: "pointer", 32650: "progress", 32651: "help",
+        }
+        for _cid, _css in _STD_CURSORS.items():
+            _h = _user32.LoadCursorW(None, _cid)
+            if _h:
+                _CURSOR_TYPE_MAP[int(_h)] = _css
+        _GetCursorInfo = _user32.GetCursorInfo
+    except Exception:
+        _GetCursorInfo = None
+
 try:
     from pynput.mouse import Controller as MouseController, Button
     from pynput.keyboard import Controller as KeyController, Key
@@ -309,7 +339,7 @@ class HostServer:
         self.sessions = {}
         self.static_info = None
         self.bench = None
-        self._enc_jobs = {}        # (seq, q, scale, cursor) -> future с кодированным кадром
+        self._enc_jobs = {}        # (seq, q, scale) -> future с кодированным кадром
         self._load_cache = (0.0, None)
         self._load_task = None
         self._loop = None
@@ -455,32 +485,56 @@ class HostServer:
             self._load_task = None
         return val
 
-    def _cursor_pos(self):
-        """Позиция курсора хоста относительно захватываемого монитора (или None)."""
-        pos = None
-        if _user32 is not None:
-            try:
-                pt = _POINT()
-                if _user32.GetCursorPos(ctypes.byref(pt)):
-                    pos = (pt.x, pt.y)
-            except Exception:
-                pos = None
-        if pos is None and INPUT_OK and self.injector.mouse:
-            try:
-                p = self.injector.mouse.position
-                pos = (int(p[0]), int(p[1]))
-            except Exception:
-                pos = None
-        if pos is None:
-            return None
-        ox, oy = self.capture.mon_offset
+    def _cursor_info(self):
+        """Позиция + ТИП курсора хоста (в координатах кадра) или None.
+
+        Тип (стрелка/текст/рука/resize/…) читаем через GetCursorInfo и отдаём
+        клиенту — он рисует курсор нужной формы у себя. Так курсор адаптивный,
+        двигается мгновенно и не заставляет перекодировать кадр."""
         frame = self.capture.frame
         if not frame:
             return None
-        x, y = pos[0] - ox, pos[1] - oy
-        if 0 <= x < frame[1] and 0 <= y < frame[2]:
-            return (x, y)
-        return None
+        x = y = None
+        ctype = "default"
+        showing = True
+        if _GetCursorInfo is not None:
+            try:
+                ci = _CURSORINFO()
+                ci.cbSize = ctypes.sizeof(_CURSORINFO)
+                if _GetCursorInfo(ctypes.byref(ci)):
+                    showing = bool(ci.flags & 0x1)
+                    x, y = ci.ptScreenPos.x, ci.ptScreenPos.y
+                    ctype = _CURSOR_TYPE_MAP.get(int(ci.hCursor or 0), "default")
+            except Exception:
+                pass
+        if x is None and _user32 is not None:
+            try:
+                pt = _POINT()
+                if _user32.GetCursorPos(ctypes.byref(pt)):
+                    x, y = pt.x, pt.y
+            except Exception:
+                pass
+        if x is None and INPUT_OK and self.injector.mouse:
+            try:
+                p = self.injector.mouse.position
+                x, y = int(p[0]), int(p[1])
+            except Exception:
+                pass
+        if x is None:
+            return None
+        ox, oy = self.capture.mon_offset
+        fx, fy = x - ox, y - oy
+        on = 0 <= fx < frame[1] and 0 <= fy < frame[2]
+        fx = max(0, min(frame[1] - 1, fx))
+        fy = max(0, min(frame[2] - 1, fy))
+        return {"x": fx, "y": fy, "type": ctype, "visible": bool(showing and on)}
+
+    def _fps_cap(self, user):
+        """Потолок FPS: владелец/админ управляют своим же хостом — им отдаём
+        весь диапазон (до 240). Остальным — заданный админом лимит max_fps."""
+        if user and user.get("role") in ("owner", "admin"):
+            return 240
+        return max(1, int((user or {}).get("max_fps", 60) or 60))
 
     def _stream_params(self, sess):
         """Эффективные FPS/качество/масштаб с учётом режима «только работа»."""
@@ -493,15 +547,15 @@ class HostServer:
         targets = [self._stream_params(s)[0] for s in self.sessions.values()]
         self.capture.max_fps = max(targets, default=30)
 
-    async def _encoded(self, frame, quality, scale, cursor):
+    async def _encoded(self, frame, quality, scale):
         """Кодирование с общим кэшем: один и тот же кадр с одинаковыми
         параметрами кодируется один раз на все сессии."""
-        key = (frame[4], int(quality), round(scale, 2), cursor)
+        key = (frame[4], int(quality), round(scale, 2))
         fut = self._enc_jobs.get(key)
         if fut is None:
             loop = asyncio.get_running_loop()
             fut = asyncio.ensure_future(
-                loop.run_in_executor(_executor, encode_jpeg, frame, quality, scale, cursor))
+                loop.run_in_executor(_executor, encode_jpeg, frame, quality, scale))
             # держим только задания текущего кадра
             self._enc_jobs = {k: v for k, v in self._enc_jobs.items() if k[0] >= frame[4]}
             self._enc_jobs[key] = fut
@@ -801,6 +855,7 @@ class HostServer:
         self._refresh_capture_fps()
         sender = asyncio.create_task(self._frame_sender(sess))
         stats = asyncio.create_task(self._stats_sender(sess))
+        cursor = asyncio.create_task(self._cursor_sender(sess))
         try:
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
@@ -813,7 +868,7 @@ class HostServer:
                 if t == "ping":
                     await ws.send_json({"type": "pong", "t": d.get("t")})
                 elif t == "config":
-                    sess.fps = min(int(d.get("fps", sess.fps)), user.get("max_fps", 60))
+                    sess.fps = min(int(d.get("fps", sess.fps)), self._fps_cap(user))
                     sess.quality = max(20, min(95, int(d.get("quality", sess.quality))))
                     sess.scale = max(0.25, min(1.0, float(d.get("scale", sess.scale))))
                     if d.get("profile") in capability.STREAM_PROFILES:
@@ -838,6 +893,7 @@ class HostServer:
         finally:
             sender.cancel()
             stats.cancel()
+            cursor.cancel()
             self.sessions.pop(sess.sid, None)
             self._refresh_capture_fps()
             state.log_session_event("disconnect", {
@@ -853,7 +909,6 @@ class HostServer:
         битрейт → FPS → разрешение, с восстановлением)."""
         last_seq = -1
         last_params = None
-        last_cursor = None
         last_pick = 0.0            # monotonic-время выбора последнего кадра
         send_ewma = 0.0
         last_adapt = time.monotonic()
@@ -863,13 +918,12 @@ class HostServer:
             budget = 1.0 / max(fps, 1)
             frame = self.capture.frame
             now = time.monotonic()
-            cursor = self._cursor_pos()
             params = (int(quality), round(scale, 2))
-            # изменение = новый кадр экрана / сдвиг курсора / смена настроек;
-            # раз в 2 с — keepalive-кадр, чтобы клиент мог обновиться
+            # изменение = новый кадр экрана / смена настроек; курсор в кадр не
+            # впечатывается (его рисует клиент), поэтому темп задают только
+            # реальные изменения экрана и выбранный FPS. Раз в 2 с — keepalive.
             changed = frame is not None and (
-                frame[4] != last_seq or params != last_params
-                or cursor != last_cursor or now - last_pick >= 2.0)
+                frame[4] != last_seq or params != last_params or now - last_pick >= 2.0)
             if not changed or now < last_pick + budget * 0.75:
                 # Ждём СОБЫТИЕ нового кадра, а не таймер: системный таймер
                 # Windows тикает ~15.6 мс и таймерный пейсинг режет FPS вдвое;
@@ -884,11 +938,11 @@ class HostServer:
                 continue
             last_pick = now
             try:
-                data, w, h, ts = await self._encoded(frame, quality, scale, cursor)
+                data, w, h, ts = await self._encoded(frame, quality, scale)
             except Exception:
                 await asyncio.sleep(0.1)
                 continue
-            last_seq, last_params, last_cursor = frame[4], params, cursor
+            last_seq, last_params = frame[4], params
             t0 = time.perf_counter()
             try:
                 await sess.ws.send_bytes(data)
@@ -937,6 +991,21 @@ class HostServer:
             except (ConnectionError, RuntimeError):
                 break
             await asyncio.sleep(1.0)
+
+    async def _cursor_sender(self, sess):
+        """Отдельный лёгкий канал позиции и типа курсора (~30 Гц, только при
+        изменении). Крошечный JSON — клиент рисует курсор нужной формы сам."""
+        last = None
+        while not sess.ws.closed:
+            info = self._cursor_info()
+            if info != last:
+                last = info
+                try:
+                    await sess.ws.send_json({"type": "cursor",
+                                             "cursor": info or {"visible": False}})
+                except (ConnectionError, RuntimeError):
+                    break
+            await asyncio.sleep(1 / 30)
 
     async def _kick(self, sess, reason):
         sess.kick_reason = reason
