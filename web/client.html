@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>App_Remote — панель клиента</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="logo">App_Remote</span>
+  <span class="muted">Панель клиента — доступные хосты</span>
+  <span style="flex:1"></span>
+  <span class="badge b-ok">Обнаружение: UDP broadcast (LAN)</span>
+</div>
+
+<div class="wrap">
+  <div class="notice">Хосты в вашей локальной сети находятся автоматически — соединение идёт напрямую по LAN,
+  без интернета и relay-серверов. Хост в другой сети можно добавить вручную по IP (порт-форвардинг/VPN — на вашей стороне;
+  встроенный P2P/NAT traversal — этап 2).</div>
+
+  <div class="row" style="margin-bottom:14px">
+    <input id="manIp" placeholder="IP хоста (для другой сети)" style="width:200px">
+    <input id="manPort" placeholder="Порт" value="8532" style="width:90px">
+    <button class="sec" onclick="addManual()">Добавить вручную</button>
+    <span style="flex:1"></span>
+    <button class="sec" onclick="loadHosts()">⟳ Обновить</button>
+  </div>
+
+  <div id="hostList" class="grid g2"></div>
+  <p id="noHosts" class="muted" style="text-align:center;margin-top:40px">
+    Поиск хостов в локальной сети…<br>Убедитесь, что на хосте запущено приложение в роли «Хост»
+    и брандмауэр разрешает python.exe.</p>
+</div>
+
+<!-- Диалог подключения -->
+<dialog id="dlgConnect">
+  <h2 id="dcTitle">Подключение</h2>
+  <div id="dcInfo" class="kv" style="margin-bottom:12px"></div>
+  <div class="tabs">
+    <button id="tabLogin" class="active" onclick="swMode('login')">Вход</button>
+    <button id="tabInvite" onclick="swMode('invite')">У меня код приглашения</button>
+  </div>
+  <div id="mInvite" style="display:none">
+    <label class="f">Код приглашения<input id="cInvCode"></label>
+  </div>
+  <label class="f">Имя пользователя<input id="cUser"></label>
+  <label class="f">Пароль<input id="cPass" type="password"></label>
+  <hr style="border-color:var(--line)">
+  <label class="f">Профиль качества<select id="cProfile">
+    <option value="office">Офис — 30 FPS, экономно</option>
+    <option value="dev" selected>Разработка — 30 FPS, чёткий текст</option>
+    <option value="design">Дизайн — 60 FPS, высокое качество</option>
+    <option value="video">Видео — 60 FPS</option>
+    <option value="game">Игры — 60 FPS</option>
+    <option value="competitive">Соревновательные — 120 FPS, пониж. разрешение</option>
+    <option value="custom">Пользовательский</option>
+  </select></label>
+  <div class="row">
+    <label class="f" style="flex:1">FPS<select id="cFps"><option>30</option><option selected>60</option><option>90</option><option>120</option><option>144</option></select></label>
+    <label class="f" style="flex:1">Качество<select id="cQ"><option value="50">Низкое</option><option value="70" selected>Среднее</option><option value="85">Высокое</option></select></label>
+    <label class="f" style="flex:1">Масштаб<select id="cScale"><option value="1">100%</option><option value="0.75">75%</option><option value="0.5">50%</option></select></label>
+  </div>
+  <p class="muted">Фактические FPS и качество зависят от сети, кодирования на хосте и возможностей этого устройства. 90–144 FPS требуют быстрой LAN.</p>
+  <div class="row">
+    <button onclick="doConnect()">Подключиться</button>
+    <button class="sec" onclick="dlgConnect.close()">Отмена</button>
+  </div>
+  <p id="cErr" class="muted" style="color:var(--err)"></p>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+let hosts = [], current = null, mode = 'login';
+
+function swMode(m) {
+  mode = m;
+  $('#mInvite').style.display = m === 'invite' ? '' : 'none';
+  $('#tabLogin').classList.toggle('active', m === 'login');
+  $('#tabInvite').classList.toggle('active', m === 'invite');
+}
+
+async function loadHosts() {
+  hosts = await (await fetch('/api/hosts')).json();
+  const box = $('#hostList'); box.innerHTML = '';
+  $('#noHosts').style.display = hosts.length ? 'none' : '';
+  for (const h of hosts) {
+    const div = document.createElement('div');
+    div.className = 'card';
+    const scen = [];
+    if ((h.ram_gb||0) >= 8) scen.push('работа');
+    if ((h.threads||0) >= 8) scen.push('разработка');
+    if (h.gpu && !/uhd|iris|basic/i.test(h.gpu)) scen.push('игры*');
+    div.innerHTML = `
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">${h.name}</h2>
+        <span class="badge ${h.accepting?'b-ok':'b-err'}">${h.accepting?'доступен':'закрыт'}</span>
+      </div>
+      <div class="kv" style="margin:8px 0">
+        <b>Адрес</b><span>${h.ip}:${h.port} ${h.manual?'(вручную)':'<span class="badge b-ok">LAN Direct</span>'}</span>
+        <b>CPU</b><span>${h.cpu||'—'} (${h.cores||'?'}я/${h.threads||'?'}п)</span>
+        <b>RAM</b><span>${h.ram_gb||'—'} ГБ</span>
+        <b>GPU</b><span>${h.gpu||'—'}</span>
+        <b>Сессий</b><span>${h.sessions ?? 0}</span>
+        <b>Сценарии</b><span>${scen.join(' / ')||'—'} <span class="muted">${scen.includes('игры*')?'(*зависит от GPU и сети)':''}</span></span>
+      </div>
+      <button ${h.accepting?'':'disabled'} onclick="openConnect('${h.ip}', ${h.port}, '${(h.name||'').replace(/'/g,'')}')">Подключиться</button>`;
+    box.appendChild(div);
+  }
+}
+
+async function addManual() {
+  const ip = $('#manIp').value.trim();
+  if (!ip) return;
+  await fetch('/api/hosts/add', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ip, port:+$('#manPort').value||8532})});
+  loadHosts();
+}
+
+async function openConnect(ip, port, name) {
+  current = {ip, port, name};
+  $('#dcTitle').textContent = 'Подключение к «' + name + '»';
+  $('#cErr').textContent = '';
+  // Пробуем получить свежие сведения напрямую с хоста
+  try {
+    const info = await (await fetch(`http://${ip}:${port}/api/info`)).json();
+    const enc = info.encoders||{};
+    $('#dcInfo').innerHTML = `
+      <b>ОС</b><span>${info.os||'—'}</span>
+      <b>GPU</b><span>${(info.gpus||[]).map(g=>g.name).join(', ')||'—'}</span>
+      <b>Аппаратные кодеки</b><span>${(enc.apis||[]).join(', ')||'нет'} ${enc.av1?'· AV1':''}</span>
+      <b>Кодек потока</b><span>MJPEG (MVP)</span>`;
+  } catch(e) { $('#dcInfo').innerHTML = '<b>Статус</b><span style="color:var(--err)">Хост недоступен по HTTP</span>'; }
+  dlgConnect.showModal();
+}
+
+$('#cProfile').onchange = () => {
+  const p = $('#cProfile').value;
+  const map = {office:[30,50,1], dev:[30,70,1], design:[60,85,1], video:[60,70,1],
+               game:[60,70,1], competitive:[120,50,0.75]};
+  if (map[p]) { $('#cFps').value = map[p][0]; $('#cQ').value = map[p][1]; $('#cScale').value = map[p][2]; }
+};
+
+async function doConnect() {
+  const {ip, port} = current;
+  const base = `http://${ip}:${port}`;
+  try {
+    if (mode === 'invite') {
+      const r = await fetch(base + '/api/redeem', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({code: $('#cInvCode').value.trim(), username: $('#cUser').value.trim(), password: $('#cPass').value})});
+      if (!r.ok) throw new Error(await r.text());
+    }
+    const r = await fetch(base + '/api/login', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username: $('#cUser').value.trim(), password: $('#cPass').value})});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    const q = new URLSearchParams({host: ip, port, token: d.token,
+      fps: $('#cFps').value, quality: $('#cQ').value, scale: $('#cScale').value,
+      profile: $('#cProfile').value, name: current.name});
+    window.open('/viewer?' + q, '_blank');
+    dlgConnect.close();
+  } catch(e) { $('#cErr').textContent = e.message; }
+}
+
+loadHosts();
+setInterval(loadHosts, 4000);
+</script>
+</body>
+</html>

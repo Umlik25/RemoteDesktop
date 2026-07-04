@@ -1,0 +1,89 @@
+:root {
+  --bg: #0e1117; --bg2: #161b25; --bg3: #1e2534;
+  --fg: #e6e9f0; --muted: #8b93a7; --line: #2a3245;
+  --acc: #4f8cff; --ok: #3ecf8e; --warn: #f5b545; --err: #f0564f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+}
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 10px; color: var(--fg); }
+a { color: var(--acc); text-decoration: none; }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+.topbar {
+  display: flex; align-items: center; gap: 14px; padding: 14px 20px;
+  background: var(--bg2); border-bottom: 1px solid var(--line);
+}
+.topbar .logo { font-weight: 700; font-size: 16px; color: var(--acc); }
+.grid { display: grid; gap: 14px; }
+.g2 { grid-template-columns: 1fr 1fr; }
+.g3 { grid-template-columns: 1fr 1fr 1fr; }
+@media (max-width: 900px) { .g2, .g3 { grid-template-columns: 1fr; } }
+.card {
+  background: var(--bg2); border: 1px solid var(--line);
+  border-radius: 10px; padding: 16px;
+}
+.muted { color: var(--muted); font-size: 12.5px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; font-size: 13px; }
+.kv b { color: var(--muted); font-weight: 500; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 500; }
+button, .btn {
+  background: var(--acc); color: #fff; border: 0; border-radius: 7px;
+  padding: 8px 14px; font-size: 13.5px; cursor: pointer;
+}
+button.sec { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); }
+button.danger { background: var(--err); }
+button.small { padding: 4px 10px; font-size: 12px; }
+button:disabled { opacity: .5; cursor: default; }
+input, select {
+  background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 7px; padding: 7px 10px; font-size: 13.5px;
+}
+input:focus, select:focus { outline: 1px solid var(--acc); }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.badge {
+  display: inline-block; padding: 2px 9px; border-radius: 20px;
+  font-size: 11.5px; font-weight: 600;
+}
+.b-ok   { background: rgba(62,207,142,.15); color: var(--ok); }
+.b-warn { background: rgba(245,181,69,.15); color: var(--warn); }
+.b-err  { background: rgba(240,86,79,.15);  color: var(--err); }
+.b-acc  { background: rgba(79,140,255,.15); color: var(--acc); }
+.bar { height: 8px; background: var(--bg3); border-radius: 6px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--acc); border-radius: 6px; transition: width .5s; }
+.bar > i.warn { background: var(--warn); }
+.bar > i.err { background: var(--err); }
+.stat { margin-bottom: 10px; }
+.stat .lbl { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 3px; }
+.tabs { display: flex; gap: 4px; margin-bottom: 14px; flex-wrap: wrap; }
+.tabs button { background: var(--bg3); color: var(--muted); border: 1px solid var(--line); }
+.tabs button.active { background: var(--acc); color: #fff; border-color: var(--acc); }
+.notice {
+  padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 12px;
+  background: rgba(245,181,69,.1); border: 1px solid rgba(245,181,69,.35); color: var(--warn);
+}
+pre.log {
+  background: #0a0d13; border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px; font-size: 11.5px; max-height: 320px; overflow: auto;
+  white-space: pre-wrap; word-break: break-all;
+}
+.bigchoice {
+  display: flex; gap: 24px; justify-content: center; margin-top: 60px; flex-wrap: wrap;
+}
+.bigchoice .card {
+  width: 320px; padding: 30px; text-align: center; cursor: pointer;
+  transition: border-color .2s, transform .15s;
+}
+.bigchoice .card:hover { border-color: var(--acc); transform: translateY(-3px); }
+.bigchoice .ico { font-size: 44px; margin-bottom: 12px; }
+dialog {
+  background: var(--bg2); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 12px; padding: 22px; min-width: 340px;
+}
+dialog::backdrop { background: rgba(0,0,0,.6); }
+label.f { display: block; margin-bottom: 10px; font-size: 13px; color: var(--muted); }
+label.f input, label.f select { width: 100%; margin-top: 3px; }

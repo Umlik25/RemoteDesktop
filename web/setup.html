@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>App_Remote — первый запуск</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="topbar"><span class="logo">App_Remote</span><span class="muted">Первый запуск — выберите роль этого компьютера</span></div>
+<div class="wrap">
+  <div class="bigchoice">
+    <div class="card" onclick="choose('host')">
+      <div class="ico">🖥️</div>
+      <h1>Этот компьютер будет хостом</h1>
+      <p class="muted">Предоставляет CPU, GPU, RAM и диск другим пользователям.
+      Владелец продолжает работать локально с гарантированным резервом ресурсов.</p>
+      <button>Выбрать роль хоста</button>
+    </div>
+    <div class="card" onclick="choose('client')">
+      <div class="ico">💻</div>
+      <h1>Этот компьютер будет клиентом</h1>
+      <p class="muted">Подключается к хосту и использует выделенные ресурсы:
+      рабочий стол, приложения, при возможности — игры.</p>
+      <button>Выбрать роль клиента</button>
+    </div>
+  </div>
+  <p class="muted" style="text-align:center;margin-top:30px">Роль можно сменить позже: <code>python app.py --reset</code></p>
+</div>
+<script>
+async function choose(role){
+  await fetch('/api/choose', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({role})});
+  document.body.innerHTML = '<div class="wrap" style="text-align:center;margin-top:80px"><h1>Роль сохранена: ' +
+    (role==='host'?'Хост':'Клиент') + '</h1><p class="muted">Приложение перезапускается… ' +
+    'Панель откроется автоматически через несколько секунд.</p></div>';
+  const port = role==='host' ? 8532 : 8600;
+  setTimeout(()=>{ location.href = 'http://127.0.0.1:'+port; }, 3500);
+}
+</script>
+</body>
+</html>

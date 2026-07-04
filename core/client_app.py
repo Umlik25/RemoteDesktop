@@ -1,0 +1,89 @@
+"""Клиентское приложение: локальная панель + обнаружение хостов в LAN.
+
+Панель доступна только на 127.0.0.1. Страница-вьювер подключается к хосту
+напрямую по WebSocket (LAN Direct) — трафик не ходит через третьи узлы.
+"""
+import asyncio
+import json
+import socket
+import time
+
+from aiohttp import web
+
+from . import state
+
+_hosts = {}  # "ip:port" -> {beacon..., "last_seen": ts}
+
+
+async def _discovery_listener(port):
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", port))
+    except OSError:
+        return
+    sock.setblocking(False)
+    while True:
+        try:
+            data, addr = await loop.sock_recvfrom(sock, 4096)
+        except OSError:
+            await asyncio.sleep(1)
+            continue
+        try:
+            d = json.loads(data.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if d.get("app") != "App_Remote" or d.get("role") != "host":
+            continue
+        key = f"{addr[0]}:{d.get('port')}"
+        d["ip"] = addr[0]
+        d["last_seen"] = time.time()
+        _hosts[key] = d
+
+
+async def page_client(request):
+    return web.FileResponse(f"{state.WEB_DIR}/client.html")
+
+
+async def page_viewer(request):
+    return web.FileResponse(f"{state.WEB_DIR}/viewer.html")
+
+
+async def api_hosts(request):
+    now = time.time()
+    out = []
+    for key, h in list(_hosts.items()):
+        if now - h["last_seen"] > 15:
+            _hosts.pop(key, None)
+            continue
+        out.append({**h, "age_s": round(now - h["last_seen"], 1)})
+    return web.json_response(out)
+
+
+async def api_add_host(request):
+    """Ручное добавление хоста по ip:port (для сетей без broadcast)."""
+    d = await request.json()
+    ip, port = d["ip"], int(d.get("port", 8532))
+    _hosts[f"{ip}:{port}"] = {"app": "App_Remote", "role": "host", "name": d.get("name", ip),
+                              "ip": ip, "port": port, "manual": True,
+                              "accepting": True, "last_seen": time.time() + 1e9}
+    return web.json_response({"ok": True})
+
+
+def build_app(config):
+    app = web.Application()
+    app.router.add_get("/", page_client)
+    app.router.add_get("/viewer", page_viewer)
+    app.router.add_static("/static/", state.WEB_DIR)
+    app.router.add_get("/api/hosts", api_hosts)
+    app.router.add_post("/api/hosts/add", api_add_host)
+
+    async def on_start(app):
+        asyncio.create_task(_discovery_listener(config.get("discovery_port", 8533)))
+    app.on_startup.append(on_start)
+    return app
+
+
+def run(config):
+    web.run_app(build_app(config), host="127.0.0.1", port=config["client_port"], print=None)

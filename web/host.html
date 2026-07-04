@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>App_Remote — панель хоста</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="logo">App_Remote</span>
+  <span class="muted">Панель хоста / владельца</span>
+  <span id="hostname" class="badge b-acc"></span>
+  <span style="flex:1"></span>
+  <span id="statusBadge" class="badge b-ok">—</span>
+</div>
+
+<div class="wrap">
+  <div id="ownerSetup" class="card" style="display:none;max-width:460px;margin:40px auto">
+    <h2>Создайте учётную запись владельца</h2>
+    <p class="muted">Владелец — привилегированная сессия: резерв ресурсов, управление пользователями и подключениями.</p>
+    <label class="f">Имя пользователя<input id="ownUser"></label>
+    <label class="f">Пароль<input id="ownPass" type="password"></label>
+    <button onclick="setupOwner()">Создать владельца</button>
+    <p id="ownerErr" class="muted" style="color:var(--err)"></p>
+  </div>
+
+  <div id="main" style="display:none">
+    <div class="tabs">
+      <button data-tab="overview" class="active">Обзор</button>
+      <button data-tab="users">Пользователи</button>
+      <button data-tab="invites">Приглашения</button>
+      <button data-tab="report">Отчёт о возможностях</button>
+      <button data-tab="logs">Журналы</button>
+      <button data-tab="settings">Настройки</button>
+    </div>
+
+    <!-- ======================= ОБЗОР ======================= -->
+    <div id="tab-overview" class="tab">
+      <div id="mvpNotice" class="notice">
+        MVP-режим: удалённые сессии видят общий рабочий стол хоста (демо-стриминг).
+        Полная изоляция сессий через VM и аппаратные кодеки H.264/HEVC/AV1 — этап 2 (см. ARCHITECTURE.md).
+        Трафик без TLS — используйте в доверенной локальной сети.
+      </div>
+      <div class="grid g2">
+        <div class="card">
+          <h2>Нагрузка хоста</h2>
+          <div class="stat"><div class="lbl"><span>CPU</span><span id="cpuV">—</span></div><div class="bar"><i id="cpuB"></i></div></div>
+          <div class="stat"><div class="lbl"><span>RAM</span><span id="ramV">—</span></div><div class="bar"><i id="ramB"></i></div></div>
+          <div class="stat"><div class="lbl"><span>GPU</span><span id="gpuV">—</span></div><div class="bar"><i id="gpuB"></i></div></div>
+          <div class="stat"><div class="lbl"><span>VRAM</span><span id="vramV">—</span></div><div class="bar"><i id="vramB"></i></div></div>
+          <div class="stat"><div class="lbl"><span>Диск</span><span id="diskV">—</span></div><div class="bar"><i id="diskB"></i></div></div>
+          <div class="kv" style="margin-top:8px">
+            <b>Сеть ↑ / ↓</b><span id="netV">—</span>
+            <b>GPU темп. / мощность</b><span id="gpuTempV">—</span>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Управление владельца</h2>
+          <div class="row" style="margin-bottom:10px">
+            <button id="btnAccept" onclick="toggle('accepting')">…</button>
+            <button class="sec" id="btnWork" onclick="toggle('work_only_mode')">…</button>
+            <button class="sec" id="btnGame" onclick="toggle('owner_gaming_mode')">…</button>
+          </div>
+          <div class="kv">
+            <b>Резерв владельца</b><span id="reserveV">—</span>
+            <b>Лимит сессий</b><span id="maxSessV">—</span>
+            <b>Захват экрана</b><span id="capV">—</span>
+            <b>Инъекция ввода</b><span id="inpV">—</span>
+          </div>
+          <p class="muted" style="margin-top:8px">При перегрузке гостевые сессии деградируют предсказуемо:
+          битрейт → FPS → разрешение → пауза (низкоприоритетные первыми). Резерв владельца соблюдается всегда.</p>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h2>Активные сессии</h2>
+        <table id="sessTable">
+          <thead><tr><th>Пользователь</th><th>IP</th><th>Маршрут</th><th>Профиль</th><th>Приоритет</th>
+          <th>FPS</th><th>Битрейт</th><th>Деградация</th><th>Подключён</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p id="noSess" class="muted">Нет активных сессий</p>
+      </div>
+    </div>
+
+    <!-- ======================= ПОЛЬЗОВАТЕЛИ ======================= -->
+    <div id="tab-users" class="tab" style="display:none">
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:10px">
+          <h2 style="margin:0">Пользователи</h2>
+          <button onclick="dlgUser.showModal()">+ Добавить пользователя</button>
+        </div>
+        <table id="usersTable">
+          <thead><tr><th>Имя</th><th>Роль</th><th>Профиль</th><th>Приоритет</th><th>Ввод</th><th>Буфер</th>
+          <th>Файлы</th><th>Макс. FPS</th><th>Статус</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ======================= ПРИГЛАШЕНИЯ ======================= -->
+    <div id="tab-invites" class="tab" style="display:none">
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <select id="invRole"><option value="guest">Гость</option><option value="user">Пользователь</option></select>
+          <select id="invProfile">
+            <option value="office">Офис</option><option value="dev">Разработка</option>
+            <option value="design">Дизайн</option><option value="video">Видео</option>
+            <option value="game">Игры</option><option value="competitive">Соревновательные</option>
+          </select>
+          <select id="invTtl"><option value="1">Код действует 1 ч</option><option value="24" selected>24 ч</option><option value="168">7 дней</option></select>
+          <select id="invSess"><option value="">Доступ бессрочно</option><option value="4">Доступ 4 ч</option><option value="24">24 ч</option><option value="168">7 дней</option></select>
+          <button onclick="createInvite()">Создать одноразовый код</button>
+        </div>
+        <p class="muted">Приглашённый вводит код и придумывает себе логин/пароль на экране подключения клиента. Код одноразовый и отзывается мгновенно.</p>
+        <table id="invTable"><thead><tr><th>Код</th><th>Роль</th><th>Профиль</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <!-- ======================= ОТЧЁТ ======================= -->
+    <div id="tab-report" class="tab" style="display:none">
+      <div id="reportBox"><p class="muted">Загрузка отчёта…</p></div>
+    </div>
+
+    <!-- ======================= ЖУРНАЛЫ ======================= -->
+    <div id="tab-logs" class="tab" style="display:none">
+      <div class="grid g2">
+        <div class="card"><h2>Журнал аудита</h2><pre class="log" id="auditLog">—</pre></div>
+        <div class="card"><h2>История сессий</h2><pre class="log" id="histLog">—</pre></div>
+      </div>
+    </div>
+
+    <!-- ======================= НАСТРОЙКИ ======================= -->
+    <div id="tab-settings" class="tab" style="display:none">
+      <div class="card" style="max-width:480px">
+        <h2>Настройки хоста</h2>
+        <label class="f">Имя хоста (видно клиентам)<input id="setName"></label>
+        <label class="f">Резерв ресурсов владельца, %<input id="setReserve" type="number" min="0" max="80"></label>
+        <label class="f">Максимум одновременных сессий<input id="setMax" type="number" min="1" max="16"></label>
+        <button onclick="saveSettings()">Сохранить</button>
+        <p class="muted" style="margin-top:10px">Порт хоста: 8532 (HTTP/WS), обнаружение: UDP 8533.
+        При первом запуске разрешите доступ в брандмауэре Windows для python.exe.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<dialog id="dlgUser">
+  <h2>Новый пользователь</h2>
+  <label class="f">Имя<input id="nuName"></label>
+  <label class="f">Пароль<input id="nuPass" type="password"></label>
+  <label class="f">Роль<select id="nuRole">
+    <option value="user">Пользователь</option><option value="guest">Гость</option><option value="admin">Администратор</option>
+  </select></label>
+  <label class="f">Профиль качества<select id="nuProfile">
+    <option value="office">Офис</option><option value="dev">Разработка</option><option value="design">Дизайн</option>
+    <option value="video">Видео</option><option value="game">Игры</option><option value="competitive">Соревновательные</option>
+  </select></label>
+  <label class="f">Приоритет<select id="nuPrio">
+    <option value="low">Низкий</option><option value="normal" selected>Обычный</option>
+    <option value="high">Высокий</option><option value="critical">Критический</option>
+  </select></label>
+  <label class="f">Макс. FPS<select id="nuFps"><option>30</option><option selected>60</option><option>90</option><option>120</option><option>144</option></select></label>
+  <label class="f"><input type="checkbox" id="nuInput" checked style="width:auto"> Разрешить клавиатуру/мышь</label>
+  <label class="f"><input type="checkbox" id="nuClip" style="width:auto"> Разрешить буфер обмена</label>
+  <label class="f"><input type="checkbox" id="nuFiles" style="width:auto"> Разрешить передачу файлов (этап 2)</label>
+  <div class="row"><button onclick="createUser()">Создать</button>
+  <button class="sec" onclick="dlgUser.close()">Отмена</button></div>
+  <p id="nuErr" class="muted" style="color:var(--err)"></p>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+let cfg = {};
+
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tabs button').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x => x.style.display = 'none');
+  b.classList.add('active');
+  $('#tab-' + b.dataset.tab).style.display = '';
+  if (b.dataset.tab === 'users') loadUsers();
+  if (b.dataset.tab === 'invites') loadInvites();
+  if (b.dataset.tab === 'report') loadReport();
+  if (b.dataset.tab === 'logs') loadLogs();
+  if (b.dataset.tab === 'settings') fillSettings();
+});
+
+async function api(path, body) {
+  const r = await fetch(path, body ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {});
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function init() {
+  const info = await api('/api/info');
+  $('#hostname').textContent = info.name;
+  if (info.needs_owner_setup) { $('#ownerSetup').style.display = ''; return; }
+  $('#main').style.display = '';
+  connectWs();
+}
+
+async function setupOwner() {
+  try {
+    await api('/api/setup_owner', {username: $('#ownUser').value.trim(), password: $('#ownPass').value});
+    location.reload();
+  } catch(e) { $('#ownerErr').textContent = e.message; }
+}
+
+function bar(id, v, warnAt=75) {
+  const el = $(id); if (v == null) { el.style.width = '0%'; return; }
+  el.style.width = Math.min(v, 100) + '%';
+  el.className = v > 90 ? 'err' : (v > warnAt ? 'warn' : '');
+}
+
+function connectWs() {
+  const ws = new WebSocket(`ws://${location.host}/ws/panel`);
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if (d.type !== 'tick') return;
+    cfg = d.config;
+    const L = d.load;
+    $('#cpuV').textContent = L.cpu_percent + '%'; bar('#cpuB', L.cpu_percent);
+    $('#ramV').textContent = L.ram_percent + '% (' + L.ram_used_gb + ' ГБ)'; bar('#ramB', L.ram_percent);
+    $('#gpuV').textContent = L.gpu_percent == null ? 'н/д' : L.gpu_percent + '%'; bar('#gpuB', L.gpu_percent);
+    $('#vramV').textContent = L.vram_percent == null ? 'н/д' : L.vram_percent + '%'; bar('#vramB', L.vram_percent);
+    $('#diskV').textContent = L.disk_percent == null ? 'н/д' : L.disk_percent + '%'; bar('#diskB', L.disk_percent);
+    $('#netV').textContent = L.net_up_mbps + ' / ' + L.net_down_mbps + ' Мбит/с';
+    $('#gpuTempV').textContent = (L.gpu_temp != null ? L.gpu_temp + '°C' : 'н/д') +
+      (L.gpu_power_w != null ? ' / ' + L.gpu_power_w + ' Вт' : '');
+    $('#capV').textContent = d.capture_ok ? 'работает' : 'НЕДОСТУПЕН';
+    $('#inpV').textContent = d.input_ok ? 'доступна' : 'недоступна';
+    $('#reserveV').textContent = cfg.owner_reserve_percent + '%';
+    $('#maxSessV').textContent = cfg.max_sessions;
+    $('#statusBadge').textContent = cfg.accepting ? 'Доступен для подключений' : 'Новые подключения остановлены';
+    $('#statusBadge').className = 'badge ' + (cfg.accepting ? 'b-ok' : 'b-warn');
+    $('#btnAccept').textContent = cfg.accepting ? '⏸ Остановить новые подключения' : '▶ Разрешить подключения';
+    $('#btnWork').textContent = (cfg.work_only_mode ? '✓ ' : '') + 'Режим «только работа»';
+    $('#btnGame').textContent = (cfg.owner_gaming_mode ? '✓ ' : '') + 'Игровая сессия владельца';
+    renderSessions(d.sessions);
+  };
+  ws.onclose = () => setTimeout(connectWs, 3000);
+}
+
+function renderSessions(list) {
+  const tb = $('#sessTable tbody'); tb.innerHTML = '';
+  $('#noSess').style.display = list.length ? 'none' : '';
+  for (const s of list) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${s.username}</td><td>${s.ip}</td>
+      <td><span class="badge ${s.route==='LAN Direct'?'b-ok':'b-acc'}">${s.route}</span></td>
+      <td>${s.profile}</td><td>${s.priority}</td><td>${s.fps_target}</td>
+      <td>${s.bitrate_mbps} Мбит/с</td>
+      <td>${s.degrade ? '<span class="badge b-warn">ступень ' + s.degrade + '</span>' : '—'}</td>
+      <td>${s.connected_at}</td>
+      <td><button class="danger small" onclick="kick('${s.sid}')">Завершить</button></td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function kick(sid) { await api('/api/sessions/kick', {sid}); }
+async function toggle(key) { await api('/api/settings', {[key]: !cfg[key]}); }
+
+async function loadUsers() {
+  const users = await api('/api/users');
+  const tb = $('#usersTable tbody'); tb.innerHTML = '';
+  for (const u of users) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${u.username}</td><td>${u.role}</td><td>${u.profile}</td><td>${u.priority}</td>
+      <td>${u.allow_input?'✓':'—'}</td><td>${u.allow_clipboard?'✓':'—'}</td><td>${u.allow_files?'✓':'—'}</td>
+      <td>${u.max_fps}</td>
+      <td>${u.blocked?'<span class="badge b-err">заблокирован</span>':'<span class="badge b-ok">активен</span>'}</td>
+      <td class="row">
+        <button class="sec small" onclick="blockUser('${u.username}', ${!u.blocked})">${u.blocked?'Разблокировать':'Блокировать'}</button>
+        ${u.role!=='owner' ? `<button class="danger small" onclick="delUser('${u.username}')">Удалить</button>` : ''}
+      </td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function createUser() {
+  try {
+    await api('/api/users/create', {
+      username: $('#nuName').value.trim(), password: $('#nuPass').value,
+      role: $('#nuRole').value, profile: $('#nuProfile').value, priority: $('#nuPrio').value,
+      max_fps: +$('#nuFps').value, allow_input: $('#nuInput').checked,
+      allow_clipboard: $('#nuClip').checked, allow_files: $('#nuFiles').checked});
+    dlgUser.close(); loadUsers();
+  } catch(e) { $('#nuErr').textContent = e.message; }
+}
+async function blockUser(username, blocked) { await api('/api/users/update', {username, fields:{blocked}}); loadUsers(); }
+async function delUser(username) { if (confirm('Удалить пользователя и отозвать доступ?')) { await api('/api/users/delete', {username}); loadUsers(); } }
+
+async function loadInvites() {
+  const inv = await api('/api/invites');
+  const tb = $('#invTable tbody'); tb.innerHTML = '';
+  for (const i of inv) {
+    const st = i.used ? '<span class="badge b-acc">использован</span>' :
+               i.expired ? '<span class="badge b-err">истёк</span>' : '<span class="badge b-ok">активен</span>';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><code>${i.code}</code></td><td>${i.role}</td><td>${i.profile}</td>
+      <td>${i.created}</td><td>${st}</td>
+      <td><button class="danger small" onclick="revokeInvite('${i.code}')">Отозвать</button></td>`;
+    tb.appendChild(tr);
+  }
+}
+async function createInvite() {
+  const d = await api('/api/invites/create', {
+    role: $('#invRole').value, profile: $('#invProfile').value,
+    ttl_hours: +$('#invTtl').value,
+    session_hours: $('#invSess').value ? +$('#invSess').value : null});
+  alert('Одноразовый код приглашения:\n\n' + d.code + '\n\nПередайте его пользователю.');
+  loadInvites();
+}
+async function revokeInvite(code) { await api('/api/invites/revoke', {code}); loadInvites(); }
+
+const CONF_RU = {high:'высокая', medium:'средняя', low:'низкая'};
+async function loadReport() {
+  const d = await api('/api/report');
+  const s = d.static, lv = d.report.levels;
+  const lvNames = {remote_work_ready:'Remote Work Ready', creative_ready:'Creative Ready',
+                   gaming_ready:'Gaming Ready', multi_gaming_ready:'Multi-Gaming Ready'};
+  let lvHtml = '';
+  for (const [k, name] of Object.entries(lvNames)) {
+    const L = lv[k];
+    lvHtml += `<div class="card" style="margin-bottom:10px">
+      <div class="row" style="justify-content:space-between">
+        <b>${name}</b>
+        <span class="badge ${L.available?'b-ok':'b-err'}">${L.available?'ДОСТУПЕН':'НЕДОСТУПЕН'}</span>
+      </div>
+      <div class="muted">Почему: ${L.reasons.join('; ')}</div>
+      <div class="muted">Ограничения: ${L.limitations.join('; ')}</div>
+      <div class="muted">Режим GPU: ${L.gpu_mode} · Достоверность: ${CONF_RU[L.confidence]||L.confidence}</div>
+    </div>`;
+  }
+  let capHtml = '<table><thead><tr><th>Профиль</th><th>Рекоменд. сессий</th><th>Доступно сейчас</th><th>Узкое место</th><th>Ожид. качество</th><th>Достоверность</th></tr></thead><tbody>';
+  for (const [k, c] of Object.entries(d.capacity)) {
+    capHtml += `<tr><td>${c.title}</td><td>${c.recommended}</td><td>${c.current_available}</td>
+      <td><span class="badge b-warn">${c.bottleneck}</span></td><td>${c.expected_quality}</td><td>${CONF_RU[c.confidence]||c.confidence}</td></tr>`;
+  }
+  capHtml += '</tbody></table>';
+  const enc = s.encoders, v = s.virtualization;
+  $('#reportBox').innerHTML = `
+    <div class="notice">${d.report.warning}</div>
+    <div class="grid g2">
+      <div class="card"><h2>Оборудование</h2><div class="kv">
+        <b>CPU</b><span>${s.cpu}</span>
+        <b>Ядра / потоки</b><span>${s.cores} / ${s.threads}</span>
+        <b>RAM</b><span>${s.ram_gb} ГБ</span>
+        <b>GPU</b><span>${s.gpus.map(g=>g.name + (g.vram_gb?` (${g.vram_gb} ГБ VRAM)`:'')).join('<br>')}</span>
+        <b>Диски</b><span>${s.disks.map(x=>`${x.mount} ${x.free_gb}/${x.total_gb} ГБ свободно`).join('<br>')}</span>
+        <b>LAN</b><span>${s.nics.map(n=>`${n.name}: ${n.speed_mbps} Мбит/с`).join('<br>')||'н/д'}</span>
+        <b>ОС</b><span>${s.os}</span>
+        <b>Бенчмарк CPU</b><span>однопоточный ${d.bench.single_score}, многопоточный ~${d.bench.multi_score_est} (${d.bench.note})</span>
+      </div></div>
+      <div class="card"><h2>Кодирование и виртуализация</h2><div class="kv">
+        <b>H.264</b><span>${enc.h264?'да':'нет'}</span>
+        <b>HEVC</b><span>${enc.hevc?'да':'нет'}</span>
+        <b>AV1</b><span>${enc.av1?'да':'нет'}</span>
+        <b>API</b><span>${enc.apis.join(', ')||'нет'}</span>
+        <b>Аппаратных энкодеров</b><span>${enc.hw_encoders}</span>
+        <b>Виртуализация CPU</b><span>${v.cpu_virt===null?'неизвестно':(v.cpu_virt?'включена':'выключена')}</span>
+        <b>Hyper-V</b><span>${v.hyperv===null?'н/д':(v.hyperv?'активен':'нет')}</span>
+        <b>IOMMU</b><span>${v.iommu===null?'неизвестно (проверьте BIOS)':(v.iommu?'да':'нет')}</span>
+        <b>GPU passthrough</b><span>${v.gpu_passthrough}</span>
+      </div>
+      <p class="muted">${enc.notes.concat(v.notes).join(' · ')}</p></div>
+    </div>
+    <div class="card" style="margin-top:14px"><h2>Уровни готовности</h2>${lvHtml}</div>
+    <div class="card" style="margin-top:14px"><h2>Capacity Planner (прогноз, не гарантия)</h2>${capHtml}
+      <p class="muted" style="margin-top:8px">Учтены: характеристики железа, короткий бенчмарк, резерв владельца ${d.config.owner_reserve_percent}% и текущая загрузка.</p>
+    </div>`;
+}
+
+async function loadLogs() {
+  const [audit, hist] = await Promise.all([api('/api/audit'), api('/api/history')]);
+  $('#auditLog').textContent = audit.map(a=>`${a.ts}  [${a.actor}] ${a.action} ${JSON.stringify(a.details)}`).reverse().join('\n') || 'пусто';
+  $('#histLog').textContent = hist.map(h=>`${h.ts}  ${h.event}  ${h.username||''}@${h.ip||''} ${h.reason?('('+h.reason+')'):''}`).reverse().join('\n') || 'пусто';
+}
+
+function fillSettings() {
+  $('#setName').value = cfg.host_name || '';
+  $('#setReserve').value = cfg.owner_reserve_percent;
+  $('#setMax').value = cfg.max_sessions;
+}
+async function saveSettings() {
+  await api('/api/settings', {host_name: $('#setName').value || null,
+    owner_reserve_percent: +$('#setReserve').value, max_sessions: +$('#setMax').value});
+  alert('Сохранено');
+}
+
+init();
+</script>
+</body>
+</html>

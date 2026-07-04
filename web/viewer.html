@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>App_Remote — сессия</title>
+<style>
+:root { --bg:#0a0d13; --fg:#e6e9f0; --acc:#4f8cff; --ok:#3ecf8e; --warn:#f5b545; --err:#f0564f; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:13px "Segoe UI",system-ui,sans-serif; overflow:hidden; }
+#stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+canvas { max-width:100vw; max-height:100vh; outline:none; cursor:crosshair; }
+#toolbar {
+  position:fixed; top:0; left:50%; transform:translateX(-50%);
+  display:flex; gap:6px; padding:6px 10px; background:rgba(14,17,23,.92);
+  border:1px solid #2a3245; border-top:0; border-radius:0 0 10px 10px; z-index:20;
+  transition:opacity .3s; align-items:center;
+}
+#toolbar.hidden { opacity:.08; }
+#toolbar:hover { opacity:1; }
+button, select {
+  background:#1e2534; color:var(--fg); border:1px solid #2a3245;
+  border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer;
+}
+button.acc { background:var(--acc); border-color:var(--acc); }
+button.danger { background:var(--err); border-color:var(--err); }
+#overlay {
+  position:fixed; top:10px; left:10px; z-index:15; min-width:250px;
+  background:rgba(10,13,19,.85); border:1px solid #2a3245; border-radius:10px;
+  padding:10px 14px; font:11.5px/1.55 Consolas,monospace; display:none;
+}
+#overlay .sec { color:#8b93a7; margin-top:6px; font-weight:700; }
+#overlay .w { color:var(--warn); }
+#overlay .e { color:var(--err); }
+#overlay b { color:var(--acc); font-weight:600; }
+#msg {
+  position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+  flex-direction:column; gap:10px; z-index:30; background:var(--bg); text-align:center;
+}
+.badge { padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; }
+.b-ok { background:rgba(62,207,142,.15); color:var(--ok); }
+.b-acc { background:rgba(79,140,255,.15); color:var(--acc); }
+</style>
+</head>
+<body>
+<div id="msg"><h2 id="msgText">Подключение…</h2><div id="msgSub" style="color:#8b93a7;max-width:480px"></div></div>
+<div id="stage" style="display:none"><canvas id="cv" tabindex="0"></canvas></div>
+
+<div id="toolbar" style="display:none">
+  <button id="btnOverlay" class="acc" onclick="toggleOverlay()">📊 Оверлей</button>
+  <select id="selProfile" onchange="applyProfile()" title="Профиль">
+    <option value="office">Офис</option><option value="dev">Разработка</option>
+    <option value="design">Дизайн</option><option value="video">Видео</option>
+    <option value="game">Игры</option><option value="competitive">Соревн.</option>
+    <option value="custom">Свой</option>
+  </select>
+  <select id="selFps" onchange="sendConfig()" title="FPS"><option>15</option><option>30</option><option>60</option><option>90</option><option>120</option><option>144</option></select>
+  <select id="selQ" onchange="sendConfig()" title="Качество"><option value="40">Q40</option><option value="55">Q55</option><option value="70">Q70</option><option value="85">Q85</option></select>
+  <select id="selScale" onchange="sendConfig()" title="Разрешение"><option value="1">100%</option><option value="0.75">75%</option><option value="0.5">50%</option></select>
+  <button id="btnInput" onclick="toggleInput()">⌨️ Ввод: вкл</button>
+  <button onclick="clipSend()" id="btnClipS" title="Отправить буфер обмена на хост">📋→</button>
+  <button onclick="clipGet()" id="btnClipG" title="Получить буфер обмена хоста">→📋</button>
+  <button onclick="document.documentElement.requestFullscreen()">⛶</button>
+  <button class="danger" onclick="disconnect()">✕ Отключиться</button>
+</div>
+
+<div id="overlay"></div>
+
+<script>
+const P = new URLSearchParams(location.search);
+const HOST = P.get('host'), PORT = P.get('port'), TOKEN = P.get('token');
+const $ = s => document.querySelector(s);
+const cv = $('#cv'), ctx = cv.getContext('2d');
+
+let ws, hello = null, lastStats = null;
+let inputEnabled = true, overlayOn = true;
+let permissions = {input:false, clipboard:false};
+
+// метрики клиента
+let frames = 0, fpsShown = 0, bytesAcc = 0, bitrate = 0;
+let rtts = [], ping = 0, jitter = 0;
+let decodeMs = 0, frameGapMs = 0, lastFrameT = 0;
+let framesDropped = 0;
+
+$('#selFps').value = P.get('fps') || '60';
+$('#selQ').value = P.get('quality') || '70';
+$('#selScale').value = P.get('scale') || '1';
+$('#selProfile').value = P.get('profile') || 'dev';
+
+function connect() {
+  ws = new WebSocket(`ws://${HOST}:${PORT}/ws/stream?token=${encodeURIComponent(TOKEN)}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { sendConfig(); };
+  ws.onmessage = onMsg;
+  ws.onclose = e => showMsg('Сессия завершена', e.reason || 'Соединение закрыто хостом');
+  ws.onerror = () => showMsg('Ошибка подключения',
+    'Проверьте, что хост запущен, доступен по сети и брандмауэр разрешает порт ' + PORT);
+}
+
+function showMsg(t, sub) {
+  $('#msg').style.display = ''; $('#stage').style.display = 'none';
+  $('#toolbar').style.display = 'none';
+  $('#msgText').textContent = t; $('#msgSub').textContent = sub || '';
+}
+
+async function onMsg(e) {
+  if (typeof e.data === 'string') {
+    const d = JSON.parse(e.data);
+    if (d.type === 'hello') {
+      hello = d;
+      permissions = d.permissions || {};
+      document.title = `App_Remote — ${d.host_name}`;
+      $('#msg').style.display = 'none';
+      $('#stage').style.display = ''; $('#toolbar').style.display = 'flex';
+      $('#btnClipS').style.display = permissions.clipboard ? '' : 'none';
+      $('#btnClipG').style.display = permissions.clipboard ? '' : 'none';
+      if (!permissions.input) { inputEnabled = false; $('#btnInput').textContent = '⌨️ Ввод: запрещён'; $('#btnInput').disabled = true; }
+      cv.focus();
+      renderOverlay();
+    } else if (d.type === 'pong') {
+      const rtt = performance.now() - d.t;
+      rtts.push(rtt); if (rtts.length > 20) rtts.shift();
+      ping = rtts.reduce((a,b)=>a+b,0) / rtts.length;
+      const mean = ping;
+      jitter = Math.sqrt(rtts.reduce((a,b)=>a+(b-mean)**2,0) / rtts.length);
+    } else if (d.type === 'stats') {
+      lastStats = d;
+    } else if (d.type === 'clipboard') {
+      try { await navigator.clipboard.writeText(d.text); } catch(_){}
+    } else if (d.type === 'kick') {
+      showMsg('Сессия завершена', d.reason);
+    }
+    return;
+  }
+  // бинарный кадр JPEG
+  bytesAcc += e.data.byteLength;
+  const t0 = performance.now();
+  try {
+    const bmp = await createImageBitmap(new Blob([e.data], {type:'image/jpeg'}));
+    if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+    decodeMs = performance.now() - t0;
+    if (lastFrameT) frameGapMs = t0 - lastFrameT;
+    lastFrameT = t0;
+    frames++;
+  } catch(_) { framesDropped++; }
+}
+
+// секундомер метрик
+setInterval(() => {
+  fpsShown = frames; frames = 0;
+  bitrate = bytesAcc * 8 / 1e6; bytesAcc = 0;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'ping', t: performance.now()}));
+  if (overlayOn) renderOverlay();
+}, 1000);
+
+function renderOverlay() {
+  const ov = $('#overlay');
+  ov.style.display = overlayOn ? '' : 'none';
+  if (!overlayOn) return;
+  const s = lastStats || {}, h = s.host || {}, sess = s.session || {};
+  const route = s.route || (hello && hello.route) || '—';
+  const routeCls = route === 'LAN Direct' ? 'b-ok' : 'b-acc';
+  const warn = (s.warnings || []).map(w => `<div class="w">⚠ ${w}</div>`).join('');
+  const inputLat = ping ? (ping / 2 + frameGapMs / 2).toFixed(0) : '—';
+  ov.innerHTML = `
+    <span class="badge ${routeCls}">${route}</span> <b>${hello ? hello.host_name : ''}</b>
+    <div class="sec">ПОТОК</div>
+    FPS: <b>${fpsShown}</b> (цель ${s.fps_target ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
+    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>${s.codec || 'MJPEG'}</b><br>
+    Разрешение: <b>${cv.width}×${cv.height}</b> · HDR: <b>нет (MVP)</b><br>
+    Профиль: <b>${sess.profile || $('#selProfile').value}</b> · Q${s.quality ?? '—'}
+    <div class="sec">ЗАДЕРЖКИ</div>
+    Ping: <b>${ping.toFixed(1)} мс</b> · Jitter: <b>${jitter.toFixed(1)} мс</b><br>
+    Ввод (оценка): <b>~${inputLat} мс</b> · Декодирование: <b>${decodeMs.toFixed(1)} мс</b><br>
+    Потери: <b>${framesDropped} кадров</b> <span style="color:#8b93a7">(транспорт TCP — пакеты не теряются, но возможны задержки)</span>
+    <div class="sec">ХОСТ</div>
+    CPU: <b>${h.cpu_percent ?? '—'}%</b> · RAM: <b>${h.ram_percent ?? '—'}%</b><br>
+    GPU: <b>${h.gpu_percent ?? 'н/д'}%</b> · VRAM: <b>${h.vram_percent ?? 'н/д'}%</b>
+    <div class="sec">КЛИЕНТ</div>
+    Декодер: <b>Canvas/CPU</b> · Вкладка FPS-цель: <b>${$('#selFps').value}</b>
+    ${warn}`;
+}
+
+function toggleOverlay() { overlayOn = !overlayOn; renderOverlay(); }
+function toggleInput() {
+  if (!permissions.input) return;
+  inputEnabled = !inputEnabled;
+  $('#btnInput').textContent = '⌨️ Ввод: ' + (inputEnabled ? 'вкл' : 'выкл');
+}
+function disconnect() { if (ws) ws.close(); showMsg('Отключено', 'Можно закрыть вкладку'); }
+
+function sendConfig() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({type:'config', fps:+$('#selFps').value, quality:+$('#selQ').value,
+    scale:+$('#selScale').value, profile:$('#selProfile').value}));
+}
+function applyProfile() {
+  const map = {office:[30,55,1], dev:[30,70,1], design:[60,85,1], video:[60,70,1],
+               game:[60,70,1], competitive:[120,40,0.75]};
+  const m = map[$('#selProfile').value];
+  if (m) { $('#selFps').value = m[0]; $('#selQ').value = m[1]; $('#selScale').value = m[2]; }
+  sendConfig();
+}
+
+// -------- ввод --------
+let evQueue = [];
+setInterval(() => {
+  if (evQueue.length && ws && ws.readyState === 1 && inputEnabled) {
+    ws.send(JSON.stringify({type:'input', events: evQueue}));
+  }
+  evQueue = [];
+}, 16);
+
+function norm(e) {
+  const r = cv.getBoundingClientRect();
+  return {x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+          y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))};
+}
+cv.addEventListener('mousemove', e => { const p = norm(e); evQueue.push({t:'mm', x:p.x, y:p.y}); });
+cv.addEventListener('mousedown', e => { e.preventDefault(); const p = norm(e); evQueue.push({t:'mm',x:p.x,y:p.y},{t:'mb',b:e.button,d:1}); cv.focus(); });
+cv.addEventListener('mouseup',   e => { e.preventDefault(); evQueue.push({t:'mb', b:e.button, d:0}); });
+cv.addEventListener('wheel',     e => { e.preventDefault(); evQueue.push({t:'wh', dy:e.deltaY}); }, {passive:false});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('keydown', e => { if (!inputEnabled) return; e.preventDefault(); evQueue.push({t:'kb', k:e.key, d:1}); });
+cv.addEventListener('keyup',   e => { if (!inputEnabled) return; e.preventDefault(); evQueue.push({t:'kb', k:e.key, d:0}); });
+
+async function clipSend() {
+  try { const text = await navigator.clipboard.readText();
+    ws.send(JSON.stringify({type:'clipboard_set', text})); } catch(_){}
+}
+function clipGet() { ws.send(JSON.stringify({type:'clipboard_get'})); }
+
+connect();
+</script>
+</body>
+</html>
