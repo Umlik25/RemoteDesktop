@@ -1,13 +1,17 @@
 """App_Remote — удалённый доступ к вычислительным ресурсам (MVP 0.1).
 
 Запуск:
-    python app.py              # первый запуск: выбор роли в браузере
-    python app.py --role host  # принудительно роль хоста
+    python app.py                       # первый запуск: выбор роли в браузере
+    python app.py --role host           # принудительно роль хоста
     python app.py --role client
-    python app.py --reset      # сбросить выбор роли
+    python app.py --reset               # сбросить выбор роли
+    python app.py --list-users          # показать пользователей хоста
+    python app.py --reset-password ИМЯ  # сменить пароль пользователю (локально)
 """
 import argparse
 import asyncio
+import getpass
+import secrets
 import sys
 import webbrowser
 
@@ -16,6 +20,46 @@ from aiohttp import web
 from core import state
 
 SETUP_PORT = 8599
+
+
+def cmd_list_users():
+    from core import auth
+    users = auth.list_users()
+    if not users:
+        print("[App_Remote] Пользователей нет (хост ещё не настроен).")
+        return
+    print(f"[App_Remote] Пользователи ({len(users)}):")
+    for u in users:
+        flag = " [ЗАБЛОКИРОВАН]" if u["blocked"] else ""
+        print(f"  - {u['username']:<20} роль={u['role']:<8} профиль={u['profile']}{flag}")
+
+
+def cmd_reset_password(username, new_password=None):
+    """Смена пароля без остановки сервера и без сброса остальных данных.
+    Запущенный хост подхватит новый пароль сразу (читает users.json при входе)."""
+    from core import auth
+    if not auth.get_user(username):
+        print(f"[App_Remote] Нет пользователя «{username}».")
+        cmd_list_users()
+        sys.exit(1)
+    generated = False
+    if not new_password:
+        try:
+            new_password = getpass.getpass("Новый пароль (Enter — сгенерировать): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            new_password = ""
+        if not new_password:
+            new_password = secrets.token_urlsafe(9)
+            generated = True
+    try:
+        auth.set_password(username, new_password, actor="cli:reset-password")
+    except ValueError as e:
+        print(f"[App_Remote] Ошибка: {e}")
+        sys.exit(1)
+    print(f"[App_Remote] Пароль для «{username}» изменён. "
+          "Активные сессии не тронуты; прежние токены входа отозваны.")
+    if generated:
+        print(f"[App_Remote] Сгенерированный пароль: {new_password}")
 
 
 def run_setup():
@@ -55,7 +99,17 @@ def main():
     ap.add_argument("--role", choices=["host", "client"])
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--list-users", action="store_true", help="показать пользователей и выйти")
+    ap.add_argument("--reset-password", metavar="ИМЯ", help="сменить пароль пользователю и выйти")
+    ap.add_argument("--password", metavar="ПАРОЛЬ", help="новый пароль (иначе спросит/сгенерирует)")
     args = ap.parse_args()
+
+    if args.list_users:
+        cmd_list_users()
+        return
+    if args.reset_password:
+        cmd_reset_password(args.reset_password, args.password)
+        return
 
     cfg = state.load_config()
     if args.reset:

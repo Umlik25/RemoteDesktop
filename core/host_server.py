@@ -236,6 +236,7 @@ class HostServer:
         r.add_get("/api/users", self.api_users)
         r.add_post("/api/users/create", self.api_user_create)
         r.add_post("/api/users/update", self.api_user_update)
+        r.add_post("/api/users/password", self.api_user_password)
         r.add_post("/api/users/delete", self.api_user_delete)
         r.add_get("/api/invites", self.api_invites)
         r.add_post("/api/invites/create", self.api_invite_create)
@@ -410,6 +411,17 @@ class HostServer:
             for s in list(self.sessions.values()):
                 if s.username == d["username"]:
                     await self._kick(s, "Пользователь заблокирован")
+        return web.json_response({"ok": True})
+
+    async def api_user_password(self, request):
+        actor = self._admin(request)
+        if not actor:
+            raise web.HTTPForbidden()
+        d = await request.json()
+        try:
+            auth.set_password(d["username"], d.get("password", ""), actor=actor)
+        except (ValueError, KeyError) as e:
+            raise web.HTTPBadRequest(text=str(e))
         return web.json_response({"ok": True})
 
     async def api_user_delete(self, request):
@@ -675,12 +687,49 @@ class HostServer:
 
     # ------------------------------------------------------------ LAN beacon
 
+    def _broadcast_targets(self):
+        """Broadcast-адреса ВСЕХ активных IPv4-интерфейсов + глобальный.
+
+        На Windows с несколькими адаптерами (Wi-Fi + Ethernet + VPN вроде
+        Radmin/Hamachi 26.x/25.x) отправка только на 255.255.255.255 часто
+        уходит лишь через один интерфейс (нередко через VPN), и клиент в
+        реальном Wi-Fi хост не видит. Направленный broadcast на каждую
+        подсеть (например 192.168.1.255) маршрутизируется в нужный интерфейс.
+        VPN-подсети (25.x/26.x) пропускаем, чтобы не светить хост в них.
+        """
+        port = self.config.get("discovery_port", 8533)
+        directed = set()
+        try:
+            for addrs in psutil.net_if_addrs().values():
+                for a in addrs:
+                    if a.family != socket.AF_INET or not a.netmask:
+                        continue
+                    try:
+                        net = ipaddress.ip_network(f"{a.address}/{a.netmask}", strict=False)
+                    except ValueError:
+                        continue
+                    if net.is_loopback:
+                        continue
+                    first = str(a.address).split(".")[0]
+                    if first in ("25", "26"):  # типичные диапазоны Radmin VPN / Hamachi
+                        continue
+                    if net.broadcast_address.is_global or net.is_private:
+                        directed.add((str(net.broadcast_address), port))
+        except Exception:
+            pass
+        # Глобальный broadcast — только как fallback: он часто уходит через
+        # VPN-адаптер и порождает дубль хоста. Если нашли реальные подсети —
+        # шлём только на них.
+        if directed:
+            return list(directed)
+        return [("255.255.255.255", port)]
+
     async def _beacon_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setblocking(False)
-        port = self.config.get("discovery_port", 8533)
         loop = asyncio.get_running_loop()
+        first_pass = True
         while True:
             s = self.static_info or {}
             payload = json.dumps({
@@ -693,10 +742,15 @@ class HostServer:
                 "accepting": self.config.get("accepting", True),
                 "sessions": len(self.sessions),
             }).encode()
-            try:
-                await loop.run_in_executor(None, sock.sendto, payload, ("255.255.255.255", port))
-            except OSError:
-                pass
+            targets = self._broadcast_targets()
+            if first_pass:
+                print(f"[App_Remote] LAN-обнаружение: рассылка на {[t[0] for t in targets]}")
+                first_pass = False
+            for tgt in targets:
+                try:
+                    await loop.run_in_executor(None, sock.sendto, payload, tgt)
+                except OSError:
+                    pass
             await asyncio.sleep(2.0)
 
 

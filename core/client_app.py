@@ -19,10 +19,25 @@ async def _discovery_listener(port):
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("", port))
-    except OSError:
+    if hasattr(socket, "SO_REUSEPORT"):  # macOS/Linux: разрешить повторную привязку
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    bound = False
+    for _ in range(10):
+        try:
+            sock.bind(("", port))
+            bound = True
+            break
+        except OSError:
+            await asyncio.sleep(1)
+    if not bound:
+        print(f"[App_Remote] Не удалось открыть UDP-порт {port} для обнаружения "
+              f"(занят или заблокирован брандмауэром). Добавляйте хосты вручную по IP.")
         return
+    print(f"[App_Remote] LAN-обнаружение слушает UDP {port}")
     sock.setblocking(False)
     while True:
         try:

@@ -269,6 +269,7 @@ async function loadUsers() {
       <td>${u.max_fps}</td>
       <td>${u.blocked?'<span class="badge b-err">заблокирован</span>':'<span class="badge b-ok">активен</span>'}</td>
       <td class="row">
+        <button class="sec small" onclick="resetPw('${u.username}')">Сбросить пароль</button>
         <button class="sec small" onclick="blockUser('${u.username}', ${!u.blocked})">${u.blocked?'Разблокировать':'Блокировать'}</button>
         ${u.role!=='owner' ? `<button class="danger small" onclick="delUser('${u.username}')">Удалить</button>` : ''}
       </td>`;
@@ -285,6 +286,13 @@ async function createUser() {
       allow_clipboard: $('#nuClip').checked, allow_files: $('#nuFiles').checked});
     dlgUser.close(); loadUsers();
   } catch(e) { $('#nuErr').textContent = e.message; }
+}
+async function resetPw(username) {
+  const pw = prompt('Новый пароль для «' + username + '» (мин. 4 символа):');
+  if (pw === null) return;
+  try { await api('/api/users/password', {username, password: pw});
+    alert('Пароль изменён. Прежние токены входа отозваны, активные сессии не тронуты.'); }
+  catch(e) { alert('Ошибка: ' + e.message); }
 }
 async function blockUser(username, blocked) { await api('/api/users/update', {username, fields:{blocked}}); loadUsers(); }
 async function delUser(username) { if (confirm('Удалить пользователя и отозвать доступ?')) { await api('/api/users/delete', {username}); loadUsers(); } }

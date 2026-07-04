@@ -110,6 +110,27 @@ def delete_user(username, actor="system"):
     state.audit("user.delete", actor, {"username": username})
 
 
+def set_password(username, new_password, actor="system"):
+    """Сменить пароль пользователю, не трогая остальные поля/пользователей.
+    Читает и пишет users.json атомарно — запущенный сервер подхватит новый
+    пароль сразу (он читает файл на каждом входе). Существующие токены
+    отзываются, активные сессии не завершаются."""
+    if not new_password or len(new_password) < 4:
+        raise ValueError("Пароль должен быть не короче 4 символов")
+    with _lock:
+        users = _load(USERS_PATH)
+        if username not in users:
+            raise ValueError("Нет такого пользователя")
+        salt = secrets.token_hex(16)
+        users[username]["salt"] = salt
+        users[username]["pw"] = _hash_pw(new_password, salt)
+        users[username]["blocked"] = False
+        _save(USERS_PATH, users)
+        for t in [t for t, v in _tokens.items() if v["username"] == username]:
+            _tokens.pop(t, None)
+    state.audit("user.password_reset", actor, {"username": username})
+
+
 def get_user(username):
     return _load(USERS_PATH).get(username)
 
