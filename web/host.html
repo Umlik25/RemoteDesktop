@@ -109,10 +109,11 @@
           </select>
           <select id="invTtl"><option value="1">Код действует 1 ч</option><option value="24" selected>24 ч</option><option value="168">7 дней</option></select>
           <select id="invSess"><option value="">Доступ бессрочно</option><option value="4">Доступ 4 ч</option><option value="24">24 ч</option><option value="168">7 дней</option></select>
+          <label class="f" style="margin:0"><input type="checkbox" id="invInput" checked style="width:auto"> Ввод</label>
           <button onclick="createInvite()">Создать одноразовый код</button>
         </div>
         <p class="muted">Приглашённый вводит код и придумывает себе логин/пароль на экране подключения клиента. Код одноразовый и отзывается мгновенно.</p>
-        <table id="invTable"><thead><tr><th>Код</th><th>Роль</th><th>Профиль</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table>
+        <table id="invTable"><thead><tr><th>Код</th><th>Роль</th><th>Профиль</th><th>Ввод</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table>
       </div>
     </div>
 
@@ -269,6 +270,7 @@ async function loadUsers() {
       <td>${u.max_fps}</td>
       <td>${u.blocked?'<span class="badge b-err">заблокирован</span>':'<span class="badge b-ok">активен</span>'}</td>
       <td class="row">
+        <button class="sec small" onclick="setUserInput('${u.username}', ${!u.allow_input})">${u.allow_input?'Запретить ввод':'Разрешить ввод'}</button>
         <button class="sec small" onclick="resetPw('${u.username}')">Сбросить пароль</button>
         <button class="sec small" onclick="blockUser('${u.username}', ${!u.blocked})">${u.blocked?'Разблокировать':'Блокировать'}</button>
         ${u.role!=='owner' ? `<button class="danger small" onclick="delUser('${u.username}')">Удалить</button>` : ''}
@@ -294,6 +296,10 @@ async function resetPw(username) {
     alert('Пароль изменён. Прежние токены входа отозваны, активные сессии не тронуты.'); }
   catch(e) { alert('Ошибка: ' + e.message); }
 }
+async function setUserInput(username, allow) {
+  await api('/api/users/update', {username, fields:{allow_input: allow}});
+  loadUsers();
+}
 async function blockUser(username, blocked) { await api('/api/users/update', {username, fields:{blocked}}); loadUsers(); }
 async function delUser(username) { if (confirm('Удалить пользователя и отозвать доступ?')) { await api('/api/users/delete', {username}); loadUsers(); } }
 
@@ -305,6 +311,7 @@ async function loadInvites() {
                i.expired ? '<span class="badge b-err">истёк</span>' : '<span class="badge b-ok">активен</span>';
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><code>${i.code}</code></td><td>${i.role}</td><td>${i.profile}</td>
+      <td>${i.allow_input !== false ? '✓' : '—'}</td>
       <td>${i.created}</td><td>${st}</td>
       <td><button class="danger small" onclick="revokeInvite('${i.code}')">Отозвать</button></td>`;
     tb.appendChild(tr);
@@ -314,6 +321,7 @@ async function createInvite() {
   const d = await api('/api/invites/create', {
     role: $('#invRole').value, profile: $('#invProfile').value,
     ttl_hours: +$('#invTtl').value,
+    allow_input: $('#invInput').checked,
     session_hours: $('#invSess').value ? +$('#invSess').value : null});
   alert('Одноразовый код приглашения:\n\n' + d.code + '\n\nПередайте его пользователю.');
   loadInvites();

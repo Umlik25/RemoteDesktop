@@ -117,12 +117,16 @@ class InputInjector:
         t = ev.get("t")
         try:
             if t == "mm" and self.screen_wh:
-                self.mouse.position = (ev["x"] * self.screen_wh[0], ev["y"] * self.screen_wh[1])
+                x = int(max(0, min(1, float(ev["x"]))) * (self.screen_wh[0] - 1))
+                y = int(max(0, min(1, float(ev["y"]))) * (self.screen_wh[1] - 1))
+                self.mouse.position = (x, y)
             elif t == "mb":
                 btn = {0: Button.left, 1: Button.middle, 2: Button.right}.get(ev.get("b", 0), Button.left)
                 (self.mouse.press if ev.get("d") else self.mouse.release)(btn)
             elif t == "wh":
-                self.mouse.scroll(0, -ev.get("dy", 0) / 100)
+                dy = int(-float(ev.get("dy", 0)) / 100)
+                if dy:
+                    self.mouse.scroll(0, dy)
             elif t == "kb":
                 key = ev.get("k", "")
                 k = KEY_MAP.get(key, key if len(key) == 1 else None)
@@ -284,6 +288,25 @@ class HostServer:
             return username
         return None
 
+    def _input_permission(self, user):
+        if not user or user.get("blocked"):
+            return False, "user_denied"
+        if not INPUT_OK:
+            return False, "backend_unavailable"
+        if not user.get("allow_input", True):
+            return False, "user_denied"
+        return True, None
+
+    def _permission_payload(self, user):
+        input_allowed, input_reason = self._input_permission(user)
+        return {
+            "input": input_allowed,
+            "input_reason": input_reason,
+            "work_only_mode": self.config.get("work_only_mode", False),
+            "clipboard": bool(user and user.get("allow_clipboard", False)),
+            "files": bool(user and user.get("allow_files", False)),
+        }
+
     def _route_for(self, ip):
         try:
             addr = ipaddress.ip_address(ip)
@@ -323,6 +346,7 @@ class HostServer:
             "gpus": s.get("gpus"),
             "encoders": s.get("encoders"),
             "accepting": self.config.get("accepting", True),
+            "input_ok": INPUT_OK,
             "sessions": len(self.sessions),
             "max_sessions": self.config.get("max_sessions", 4),
             "needs_owner_setup": not auth.has_users(),
@@ -349,10 +373,7 @@ class HostServer:
         state.audit("login.ok", d["username"], {"ip": request.remote})
         return web.json_response({"token": token, "role": u["role"],
                                   "profile": u.get("profile", "office"),
-                                  "permissions": {
-                                      "input": u.get("allow_input", True),
-                                      "clipboard": u.get("allow_clipboard", False),
-                                      "files": u.get("allow_files", False)}})
+                                  "permissions": self._permission_payload(u)})
 
     async def api_redeem(self, request):
         d = await request.json()
@@ -448,6 +469,7 @@ class HostServer:
         code = auth.create_invite(role=d.get("role", "guest"), profile=d.get("profile", "office"),
                                   ttl_hours=float(d.get("ttl_hours", 24)),
                                   priority=d.get("priority", "low"),
+                                  allow_input=d.get("allow_input", True),
                                   session_hours=d.get("session_hours"), actor=actor)
         return web.json_response({"code": code})
 
@@ -519,7 +541,8 @@ class HostServer:
                 except asyncio.TimeoutError:
                     pass
         finally:
-            return ws
+            pass
+        return ws
 
     # ------------------------------------------------------------ WS: стрим
 
@@ -548,10 +571,7 @@ class HostServer:
                             "codec": "MJPEG (MVP; H.264/HEVC в дорожной карте)",
                             "profile": sess.profile,
                             "fps": sess.fps, "quality": sess.quality, "scale": sess.scale,
-                            "permissions": {
-                                "input": user.get("allow_input", True) and not self.config.get("work_only_mode"),
-                                "clipboard": user.get("allow_clipboard", False),
-                                "files": user.get("allow_files", False)},
+                            "permissions": self._permission_payload(user),
                             "isolation_note": "MVP: все удалённые сессии видят общий рабочий стол хоста. "
                                               "Изоляция через VM — этап 2."})
         sender = asyncio.create_task(self._frame_sender(sess))
@@ -574,7 +594,8 @@ class HostServer:
                     if d.get("profile") in capability.STREAM_PROFILES:
                         sess.profile = d["profile"]
                 elif t == "input":
-                    if user.get("allow_input", True) and not self.config.get("work_only_mode"):
+                    current_user = auth.get_user(username) or user
+                    if self._input_permission(current_user)[0]:
                         for ev in d.get("events", []):
                             self.injector.apply(ev)
                 elif t == "clipboard_get" and user.get("allow_clipboard"):
@@ -630,6 +651,7 @@ class HostServer:
         while not sess.ws.closed:
             load = hwinfo.get_load()
             fps, quality, scale = sess.effective()
+            user = auth.get_user(sess.username) or sess.user
             warn = list(sess.warnings)
             if sess.degrade > 0:
                 warn.append(f"Хост перегружен: применена ступень деградации {sess.degrade} "
@@ -640,6 +662,7 @@ class HostServer:
                     "session": sess.info(),
                     "codec": "MJPEG", "route": sess.route,
                     "fps_target": fps, "quality": quality, "scale": scale,
+                    "permissions": self._permission_payload(user),
                     "warnings": warn,
                 })
             except (ConnectionError, RuntimeError):
