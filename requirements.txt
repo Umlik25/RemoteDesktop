@@ -7,3 +7,6 @@ pynput>=1.7
 # Необязательно: без него работает запасной GDI-захват (~30 FPS).
 dxcam; sys_platform == "win32"
 numpy; sys_platform == "win32"
+# Быстрое JPEG-кодирование на хосте (libjpeg-turbo, в 3-5 раз быстрее Pillow).
+# Необязательно: без него используется Pillow.
+opencv-python-headless; sys_platform == "win32"

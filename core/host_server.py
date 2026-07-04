@@ -25,7 +25,7 @@ from . import auth, capability, hwinfo, state
 
 try:
     import mss
-    from PIL import Image, ImageDraw
+    from PIL import Image
     CAPTURE_OK = True
     _BILINEAR = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
 except Exception:
@@ -38,6 +38,15 @@ try:
     DXCAM_OK = hwinfo.IS_WIN
 except Exception:
     DXCAM_OK = False
+
+# Быстрое кодирование: OpenCV (libjpeg-turbo, SIMD) кодирует JPEG в 3–5 раз
+# быстрее Pillow — на 1440p это разница между ~20 и 60+ FPS. Fallback — Pillow.
+try:
+    import numpy as np
+    import cv2
+    CV2_OK = True
+except Exception:
+    CV2_OK = False
 
 # GetCursorPos: mss не захватывает курсор, поэтому его позицию читаем отдельно
 # и рисуем в кадр на стороне хоста.
@@ -85,7 +94,7 @@ if _user32 is not None:
 
 try:
     from pynput.mouse import Controller as MouseController, Button
-    from pynput.keyboard import Controller as KeyController, Key
+    from pynput.keyboard import Controller as KeyController, Key, KeyCode
     INPUT_OK = True
 except Exception:
     INPUT_OK = False
@@ -198,20 +207,25 @@ class ScreenCapture:
                 time.sleep(delay)
 
 
-def encode_jpeg(frame, quality, scale, cursor=None):
+def encode_jpeg(frame, quality, scale):
     raw, w, h, ts, seq = frame
+    if CV2_OK:
+        try:
+            arr = np.frombuffer(raw, np.uint8).reshape(h, w, 4)
+            if scale < 0.999:
+                nw = max(2, int(w * scale)) // 2 * 2
+                nh = max(2, int(h * scale)) // 2 * 2
+                arr = cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_AREA)
+            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+            if ok:
+                return buf.tobytes(), bgr.shape[1], bgr.shape[0], ts
+        except Exception:
+            pass
     img = Image.frombytes("RGB", (w, h), raw, "raw", "BGRX")
     if scale < 0.999:
         img = img.resize((max(2, int(w * scale)) // 2 * 2,
                           max(2, int(h * scale)) // 2 * 2), _BILINEAR)
-    if cursor is not None:
-        # mss не захватывает курсор — рисуем стрелку по фактической позиции
-        k = img.width / w
-        cx, cy = cursor[0] * k, cursor[1] * k
-        d = ImageDraw.Draw(img)
-        pts = [(cx, cy), (cx, cy + 17), (cx + 4.5, cy + 13), (cx + 7.5, cy + 19.5),
-               (cx + 10.5, cy + 18), (cx + 8, cy + 12), (cx + 12.5, cy + 12)]
-        d.polygon(pts, fill=(255, 255, 255), outline=(25, 25, 25))
     buf = io.BytesIO()
     # subsampling=2 (4:2:0) — заметно меньше и быстрее при том же видимом качестве
     img.save(buf, "JPEG", quality=int(quality), subsampling=2)
@@ -221,6 +235,8 @@ def encode_jpeg(frame, quality, scale, cursor=None):
 # ---------------------------------------------------------------- ввод
 
 KEY_MAP = {}
+BTN_MAP = {}
+_VK_PUNCT = {}
 if INPUT_OK:
     KEY_MAP = {
         "Enter": Key.enter, "Backspace": Key.backspace, "Tab": Key.tab,
@@ -231,6 +247,34 @@ if INPUT_OK:
         "CapsLock": Key.caps_lock, " ": Key.space,
         **{f"F{i}": getattr(Key, f"f{i}") for i in range(1, 13)},
     }
+    for _name, _attr in (("ContextMenu", "menu"), ("AltGraph", "alt_gr"),
+                         ("NumLock", "num_lock"), ("ScrollLock", "scroll_lock"),
+                         ("Pause", "pause"), ("PrintScreen", "print_screen")):
+        _k = getattr(Key, _attr, None)
+        if _k is not None:
+            KEY_MAP[_name] = _k
+    BTN_MAP = {0: Button.left, 1: Button.middle, 2: Button.right}
+    for _b, _attr in ((3, "x1"), (4, "x2")):   # боковые кнопки (назад/вперёд)
+        _btn = getattr(Button, _attr, None)
+        if _btn is not None:
+            BTN_MAP[_b] = _btn
+    # Виртуальные коды пунктуации US-раскладки: шорткаты (Ctrl+/, Ctrl+.)
+    # работают независимо от текущей раскладки хоста.
+    _VK_PUNCT = {".": 0xBE, ",": 0xBC, "/": 0xBF, ";": 0xBA, "'": 0xDE,
+                 "[": 0xDB, "]": 0xDD, "\\": 0xDC, "`": 0xC0, "-": 0xBD, "=": 0xBB}
+
+
+def _char_key(ch):
+    """Символ -> клавиша. Латиница/цифры/пунктуация идут виртуальными кодами
+    (VK), которые не зависят от раскладки хоста: Ctrl+C работает, даже если на
+    хосте включён русский. Остальное — как символ (Unicode-фолбэк pynput)."""
+    if hwinfo.IS_WIN:
+        if ch.isascii() and ch.isalnum():
+            return KeyCode.from_vk(ord(ch.upper()))
+        vk = _VK_PUNCT.get(ch)
+        if vk is not None:
+            return KeyCode.from_vk(vk)
+    return ch
 
 
 class InputInjector:
@@ -249,17 +293,33 @@ class InputInjector:
                 y = int(max(0, min(1, float(ev["y"]))) * (self.screen_wh[1] - 1))
                 self.mouse.position = (x, y)
             elif t == "mb":
-                btn = {0: Button.left, 1: Button.middle, 2: Button.right}.get(ev.get("b", 0), Button.left)
-                (self.mouse.press if ev.get("d") else self.mouse.release)(btn)
+                btn = BTN_MAP.get(ev.get("b", 0))
+                if btn is not None:
+                    (self.mouse.press if ev.get("d") else self.mouse.release)(btn)
             elif t == "wh":
                 dy = int(-float(ev.get("dy", 0)) / 100)
-                if dy:
-                    self.mouse.scroll(0, dy)
+                dx = int(float(ev.get("dx", 0)) / 100)
+                if dx or dy:
+                    self.mouse.scroll(dx, dy)
             elif t == "kb":
                 key = ev.get("k", "")
-                k = KEY_MAP.get(key, key if len(key) == 1 else None)
+                k = KEY_MAP.get(key)
+                if k is None and len(key) == 1:
+                    k = _char_key(key)
                 if k is not None:
                     (self.kb.press if ev.get("d") else self.kb.release)(k)
+            elif t == "txt":
+                # Текст печатается КАК ЕСТЬ (Unicode-инъекция): точка, кириллица,
+                # любой символ — независимо от раскладок клиента и хоста.
+                s = str(ev.get("s", ""))[:32]
+                if s:
+                    self.kb.type(s)
+            elif t == "lang":
+                # Win+Space — переключение языка ввода на хосте
+                self.kb.press(Key.cmd)
+                self.kb.press(Key.space)
+                self.kb.release(Key.space)
+                self.kb.release(Key.cmd)
         except Exception:
             pass
 
@@ -843,10 +903,12 @@ class HostServer:
         self.sessions[sess.sid] = sess
         state.log_session_event("connect", {"sid": sess.sid, "username": username,
                                             "ip": sess.ip, "route": sess.route})
+        scr = [self.capture.frame[1], self.capture.frame[2]] if self.capture.frame else None
         await ws.send_json({"type": "hello", "sid": sess.sid,
                             "host_name": self.host_name(),
                             "route": sess.route,
                             "codec": "MJPEG (MVP; H.264/HEVC в дорожной карте)",
+                            "screen": scr,
                             "profile": sess.profile,
                             "fps": sess.fps, "quality": sess.quality, "scale": sess.scale,
                             "permissions": self._permission_payload(user),
@@ -880,9 +942,6 @@ class HostServer:
                     if self._input_permission(current_user)[0]:
                         for ev in d.get("events", []):
                             self.injector.apply(ev)
-                        if d.get("events"):
-                            # курсор сдвинулся — будим отправителей без ожидания кадра
-                            self._notify_frame()
                 elif t == "clipboard_get" and user.get("allow_clipboard"):
                     loop = asyncio.get_running_loop()
                     text = await loop.run_in_executor(_executor, clipboard_get)
