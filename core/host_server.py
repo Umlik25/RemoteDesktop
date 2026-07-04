@@ -25,10 +25,33 @@ from . import auth, capability, hwinfo, state
 
 try:
     import mss
-    from PIL import Image
+    from PIL import Image, ImageDraw
     CAPTURE_OK = True
+    _BILINEAR = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
 except Exception:
     CAPTURE_OK = False
+
+# Быстрый путь захвата: DXGI Desktop Duplication (dxcam) — 60+ FPS и
+# аппаратное определение «кадр не изменился». Fallback — mss (GDI, ~30 FPS).
+try:
+    import dxcam
+    DXCAM_OK = hwinfo.IS_WIN
+except Exception:
+    DXCAM_OK = False
+
+# GetCursorPos: mss не захватывает курсор, поэтому его позицию читаем отдельно
+# и рисуем в кадр на стороне хоста.
+_user32 = None
+if hwinfo.IS_WIN:
+    try:
+        import ctypes
+
+        class _POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        _user32 = ctypes.windll.user32
+    except Exception:
+        _user32 = None
 
 try:
     from pynput.mouse import Controller as MouseController, Button
@@ -45,12 +68,19 @@ _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 # ---------------------------------------------------------------- захват экрана
 
 class ScreenCapture:
-    """Отдельный поток захвата: хранит последний сырой кадр."""
+    """Отдельный поток захвата: хранит последний сырой кадр.
+
+    seq растёт только когда содержимое экрана реально изменилось
+    (memcmp предыдущего кадра) — статичный экран не кодируется и не шлётся,
+    что убирает лишнюю нагрузку CPU и трафик."""
 
     def __init__(self):
-        self.frame = None          # (bytes BGRA, width, height, ts)
+        self.frame = None          # (bytes BGRA, width, height, ts, seq)
         self.running = False
         self.max_fps = 30
+        self.mon_offset = (0, 0)   # left/top захватываемого монитора
+        self.backend = None        # "dxgi" | "gdi"
+        self.on_frame = None       # колбэк «появился новый кадр» (из потока захвата)
         self._thread = None
 
     def start(self):
@@ -65,13 +95,71 @@ class ScreenCapture:
         self.running = False
 
     def _loop(self):
+        if DXCAM_OK and self._loop_dxcam():
+            return
+        self._loop_mss()
+
+    def _loop_dxcam(self):
+        """DXGI Desktop Duplication: быстрый захват, grab() сам возвращает None,
+        если экран не менялся. Возврат False -> откат на mss."""
+        try:
+            cam = dxcam.create(output_color="BGRA")
+            if cam is None:
+                return False
+        except Exception:
+            return False
+        print("[App_Remote] Захват экрана: DXGI Desktop Duplication (быстрый)")
+        self.backend = "dxgi"
+        self.mon_offset = (0, 0)   # dxcam захватывает основной монитор с (0,0)
+        seq = 0
+        errors = 0
+        try:
+            while self.running:
+                t0 = time.perf_counter()
+                try:
+                    f = cam.grab()
+                    errors = 0
+                except Exception:
+                    errors += 1
+                    if errors > 50:          # дупликатор умер (смена режима и т.п.)
+                        print("[App_Remote] DXGI-захват сбоит — переключаюсь на GDI/mss")
+                        return False
+                    time.sleep(0.05)
+                    continue
+                if f is not None:
+                    seq += 1
+                    h, w = f.shape[:2]
+                    self.frame = (f.tobytes(), w, h, time.time(), seq)
+                    if self.on_frame:
+                        self.on_frame()
+                dt = time.perf_counter() - t0
+                time.sleep(max(0.001, 1.0 / max(self.max_fps, 1) - dt))
+        finally:
+            try:
+                cam.release()
+            except Exception:
+                pass
+        return True
+
+    def _loop_mss(self):
+        prev = None
+        seq = 0
+        self.backend = "gdi"
+        print("[App_Remote] Захват экрана: GDI/mss (запасной путь)")
         with mss.mss() as sct:
             mon = sct.monitors[1]
+            self.mon_offset = (mon.get("left", 0), mon.get("top", 0))
             while self.running:
                 t0 = time.perf_counter()
                 try:
                     img = sct.grab(mon)
-                    self.frame = (img.bgra, img.width, img.height, time.time())
+                    raw = img.bgra
+                    if prev is None or raw != prev:   # memcmp: быстрый, с ранним выходом
+                        seq += 1
+                        self.frame = (raw, img.width, img.height, time.time(), seq)
+                        prev = raw
+                        if self.on_frame:
+                            self.on_frame()
                 except Exception:
                     time.sleep(0.5)
                     continue
@@ -80,13 +168,23 @@ class ScreenCapture:
                 time.sleep(delay)
 
 
-def encode_jpeg(frame, quality, scale):
-    raw, w, h, ts = frame
+def encode_jpeg(frame, quality, scale, cursor=None):
+    raw, w, h, ts, seq = frame
     img = Image.frombytes("RGB", (w, h), raw, "raw", "BGRX")
     if scale < 0.999:
-        img = img.resize((max(2, int(w * scale)) // 2 * 2, max(2, int(h * scale)) // 2 * 2))
+        img = img.resize((max(2, int(w * scale)) // 2 * 2,
+                          max(2, int(h * scale)) // 2 * 2), _BILINEAR)
+    if cursor is not None:
+        # mss не захватывает курсор — рисуем стрелку по фактической позиции
+        k = img.width / w
+        cx, cy = cursor[0] * k, cursor[1] * k
+        d = ImageDraw.Draw(img)
+        pts = [(cx, cy), (cx, cy + 17), (cx + 4.5, cy + 13), (cx + 7.5, cy + 19.5),
+               (cx + 10.5, cy + 18), (cx + 8, cy + 12), (cx + 12.5, cy + 12)]
+        d.polygon(pts, fill=(255, 255, 255), outline=(25, 25, 25))
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=int(quality))
+    # subsampling=2 (4:2:0) — заметно меньше и быстрее при том же видимом качестве
+    img.save(buf, "JPEG", quality=int(quality), subsampling=2)
     return buf.getvalue(), img.width, img.height, ts
 
 
@@ -166,7 +264,8 @@ class Session:
         self.fps = min(base["fps"], user.get("max_fps", 60))
         self.quality = base["quality"]
         self.scale = base["scale"]
-        self.degrade = 0           # 0..4 — ступень деградации
+        self.degrade = 0           # 0..4 — ступень деградации по нагрузке хоста
+        self.net_degrade = 0       # 0..3 — деградация из-за пропускной способности сети
         self.priority = user.get("priority", "normal")
         self.frames = 0
         self.bytes = 0
@@ -176,13 +275,15 @@ class Session:
         self.kick_reason = None
 
     def effective(self):
-        """Параметры с учётом ступени деградации: битрейт → FPS → разрешение."""
+        """Параметры с учётом деградации (нагрузка хоста + сеть):
+        битрейт → FPS → разрешение."""
         q, f, s = self.quality, self.fps, self.scale
-        if self.degrade >= 1:
+        lvl = min(4, self.degrade + self.net_degrade)
+        if lvl >= 1:
             q = max(30, q - 20)
-        if self.degrade >= 2:
+        if lvl >= 2:
             f = max(10, f // 2)
-        if self.degrade >= 3:
+        if lvl >= 3:
             s = min(s, 0.5)
         return f, q, s
 
@@ -194,7 +295,7 @@ class Session:
             "priority": self.priority,
             "connected_at": time.strftime("%H:%M:%S", time.localtime(self.connected_at)),
             "fps_target": f, "quality": q, "scale": s,
-            "degrade": self.degrade,
+            "degrade": self.degrade, "net_degrade": self.net_degrade,
             "bitrate_mbps": round(self.bitrate_mbps, 1),
             "frames": self.frames,
         }
@@ -208,6 +309,11 @@ class HostServer:
         self.sessions = {}
         self.static_info = None
         self.bench = None
+        self._enc_jobs = {}        # (seq, q, scale, cursor) -> future с кодированным кадром
+        self._load_cache = (0.0, None)
+        self._load_task = None
+        self._loop = None
+        self._frame_evt = None     # событие «есть новый кадр» для отправителей
         self.app = self._build_app()
 
     # ------------------------------------------------------------ HTTP app
@@ -241,6 +347,8 @@ class HostServer:
         r.add_post("/api/users/create", self.api_user_create)
         r.add_post("/api/users/update", self.api_user_update)
         r.add_post("/api/users/password", self.api_user_password)
+        r.add_post("/api/reset/create", self.api_reset_create)
+        r.add_post("/api/reset/redeem", self.api_reset_redeem)
         r.add_post("/api/users/delete", self.api_user_delete)
         r.add_get("/api/invites", self.api_invites)
         r.add_post("/api/invites/create", self.api_invite_create)
@@ -257,9 +365,12 @@ class HostServer:
 
     async def _on_start(self, app):
         loop = asyncio.get_running_loop()
+        self._loop = loop
+        self._frame_evt = asyncio.Event()
         self.static_info = await loop.run_in_executor(_executor, hwinfo.get_static_info)
         self.bench = await loop.run_in_executor(_executor, hwinfo.quick_benchmark)
         if CAPTURE_OK:
+            self.capture.on_frame = self._frame_notify_threadsafe
             self.capture.start()
             for _ in range(50):
                 if self.capture.frame:
@@ -306,6 +417,95 @@ class HostServer:
             "clipboard": bool(user and user.get("allow_clipboard", False)),
             "files": bool(user and user.get("allow_files", False)),
         }
+
+    def _frame_notify_threadsafe(self):
+        """Из потока захвата: разбудить отправителей кадров в event loop."""
+        loop = self._loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._notify_frame)
+            except RuntimeError:
+                pass
+
+    def _notify_frame(self):
+        ev = self._frame_evt
+        if ev is not None:
+            self._frame_evt = asyncio.Event()
+            ev.set()
+
+    async def _get_load(self):
+        """hwinfo.get_load() без блокировки event loop и не чаще раза в ~1.5 с.
+
+        Прямой вызов запускает nvidia-smi (100–300 мс) — раньше это делалось
+        синхронно в трёх местах и регулярно замораживало стрим."""
+        ts, val = self._load_cache
+        if val is not None and time.monotonic() - ts < 1.5:
+            return val
+        if self._load_task is None:
+            loop = asyncio.get_running_loop()
+            self._load_task = asyncio.ensure_future(
+                loop.run_in_executor(_executor, hwinfo.get_load))
+        task = self._load_task
+        try:
+            val = await asyncio.shield(task)
+        except Exception:
+            return self._load_cache[1] or {}
+        if self._load_task is task:
+            self._load_cache = (time.monotonic(), val)
+            self._load_task = None
+        return val
+
+    def _cursor_pos(self):
+        """Позиция курсора хоста относительно захватываемого монитора (или None)."""
+        pos = None
+        if _user32 is not None:
+            try:
+                pt = _POINT()
+                if _user32.GetCursorPos(ctypes.byref(pt)):
+                    pos = (pt.x, pt.y)
+            except Exception:
+                pos = None
+        if pos is None and INPUT_OK and self.injector.mouse:
+            try:
+                p = self.injector.mouse.position
+                pos = (int(p[0]), int(p[1]))
+            except Exception:
+                pos = None
+        if pos is None:
+            return None
+        ox, oy = self.capture.mon_offset
+        frame = self.capture.frame
+        if not frame:
+            return None
+        x, y = pos[0] - ox, pos[1] - oy
+        if 0 <= x < frame[1] and 0 <= y < frame[2]:
+            return (x, y)
+        return None
+
+    def _stream_params(self, sess):
+        """Эффективные FPS/качество/масштаб с учётом режима «только работа»."""
+        fps, q, s = sess.effective()
+        if self.config.get("work_only_mode") and sess.user.get("role") not in ("owner", "admin"):
+            fps, q = min(fps, 30), min(q, 60)
+        return fps, q, s
+
+    def _refresh_capture_fps(self):
+        targets = [self._stream_params(s)[0] for s in self.sessions.values()]
+        self.capture.max_fps = max(targets, default=30)
+
+    async def _encoded(self, frame, quality, scale, cursor):
+        """Кодирование с общим кэшем: один и тот же кадр с одинаковыми
+        параметрами кодируется один раз на все сессии."""
+        key = (frame[4], int(quality), round(scale, 2), cursor)
+        fut = self._enc_jobs.get(key)
+        if fut is None:
+            loop = asyncio.get_running_loop()
+            fut = asyncio.ensure_future(
+                loop.run_in_executor(_executor, encode_jpeg, frame, quality, scale, cursor))
+            # держим только задания текущего кадра
+            self._enc_jobs = {k: v for k, v in self._enc_jobs.items() if k[0] >= frame[4]}
+            self._enc_jobs[key] = fut
+        return await asyncio.shield(fut)
 
     def _route_for(self, ip):
         try:
@@ -386,7 +586,7 @@ class HostServer:
     async def api_report(self, request):
         if not self._admin(request):
             raise web.HTTPForbidden()
-        load = hwinfo.get_load()
+        load = await self._get_load()
         rep = capability.build_report(self.static_info, self.bench, load, self.config)
         cap = capability.capacity_plan(self.static_info, self.bench, load, self.config)
         return web.json_response({"static": self.static_info, "bench": self.bench,
@@ -394,7 +594,7 @@ class HostServer:
                                   "config": self.config})
 
     async def api_load(self, request):
-        return web.json_response(hwinfo.get_load())
+        return web.json_response(await self._get_load())
 
     async def api_users(self, request):
         if not self._admin(request):
@@ -444,6 +644,30 @@ class HostServer:
         except (ValueError, KeyError) as e:
             raise web.HTTPBadRequest(text=str(e))
         return web.json_response({"ok": True})
+
+    async def api_reset_create(self, request):
+        actor = self._admin(request)
+        if not actor:
+            raise web.HTTPForbidden()
+        d = await request.json()
+        try:
+            code = auth.create_reset_code(d["username"],
+                                          ttl_hours=float(d.get("ttl_hours", 1)), actor=actor)
+        except (ValueError, KeyError) as e:
+            raise web.HTTPBadRequest(text=str(e))
+        return web.json_response({"code": code})
+
+    async def api_reset_redeem(self, request):
+        """Публичный: пользователь вводит одноразовый код и новый пароль."""
+        d = await request.json()
+        try:
+            username = auth.redeem_reset_code(str(d.get("code", "")).strip(),
+                                              d.get("password", ""))
+        except (ValueError, KeyError) as e:
+            state.audit("reset_code.fail", "?", {"ip": request.remote})
+            await asyncio.sleep(1.0)   # антиперебор
+            raise web.HTTPBadRequest(text=str(e))
+        return web.json_response({"ok": True, "username": username})
 
     async def api_user_delete(self, request):
         actor = self._admin(request)
@@ -531,7 +755,7 @@ class HostServer:
             while not ws.closed:
                 await ws.send_json({
                     "type": "tick",
-                    "load": hwinfo.get_load(),
+                    "load": await self._get_load(),
                     "sessions": [s.info() for s in self.sessions.values()],
                     "config": self.config,
                     "capture_ok": CAPTURE_OK, "input_ok": INPUT_OK,
@@ -574,6 +798,7 @@ class HostServer:
                             "permissions": self._permission_payload(user),
                             "isolation_note": "MVP: все удалённые сессии видят общий рабочий стол хоста. "
                                               "Изоляция через VM — этап 2."})
+        self._refresh_capture_fps()
         sender = asyncio.create_task(self._frame_sender(sess))
         stats = asyncio.create_task(self._stats_sender(sess))
         try:
@@ -593,11 +818,16 @@ class HostServer:
                     sess.scale = max(0.25, min(1.0, float(d.get("scale", sess.scale))))
                     if d.get("profile") in capability.STREAM_PROFILES:
                         sess.profile = d["profile"]
+                    sess.net_degrade = 0   # пользователь сменил настройки — начинаем заново
+                    self._refresh_capture_fps()
                 elif t == "input":
                     current_user = auth.get_user(username) or user
                     if self._input_permission(current_user)[0]:
                         for ev in d.get("events", []):
                             self.injector.apply(ev)
+                        if d.get("events"):
+                            # курсор сдвинулся — будим отправителей без ожидания кадра
+                            self._notify_frame()
                 elif t == "clipboard_get" and user.get("allow_clipboard"):
                     loop = asyncio.get_running_loop()
                     text = await loop.run_in_executor(_executor, clipboard_get)
@@ -609,6 +839,7 @@ class HostServer:
             sender.cancel()
             stats.cancel()
             self.sessions.pop(sess.sid, None)
+            self._refresh_capture_fps()
             state.log_session_event("disconnect", {
                 "sid": sess.sid, "username": username, "ip": sess.ip,
                 "frames": sess.frames, "mb_sent": round(sess.bytes / 2**20, 1),
@@ -617,57 +848,95 @@ class HostServer:
         return ws
 
     async def _frame_sender(self, sess):
-        loop = asyncio.get_running_loop()
-        last_ts = 0.0
+        """Отправка кадров: пропускает неизменённые, держит целевой FPS и
+        адаптируется к каналу (если сеть не успевает — ступени деградации:
+        битрейт → FPS → разрешение, с восстановлением)."""
+        last_seq = -1
+        last_params = None
+        last_cursor = None
+        last_pick = 0.0            # monotonic-время выбора последнего кадра
+        send_ewma = 0.0
+        last_adapt = time.monotonic()
         while not sess.ws.closed:
-            fps, quality, scale = sess.effective()
+            ev = self._frame_evt
+            fps, quality, scale = self._stream_params(sess)
+            budget = 1.0 / max(fps, 1)
             frame = self.capture.frame
-            if frame is None or frame[3] <= last_ts:
-                await asyncio.sleep(0.005)
+            now = time.monotonic()
+            cursor = self._cursor_pos()
+            params = (int(quality), round(scale, 2))
+            # изменение = новый кадр экрана / сдвиг курсора / смена настроек;
+            # раз в 2 с — keepalive-кадр, чтобы клиент мог обновиться
+            changed = frame is not None and (
+                frame[4] != last_seq or params != last_params
+                or cursor != last_cursor or now - last_pick >= 2.0)
+            if not changed or now < last_pick + budget * 0.75:
+                # Ждём СОБЫТИЕ нового кадра, а не таймер: системный таймер
+                # Windows тикает ~15.6 мс и таймерный пейсинг режет FPS вдвое;
+                # call_soon_threadsafe будит цикл мгновенно.
+                if ev is None:
+                    await asyncio.sleep(0.05)
+                else:
+                    try:
+                        await asyncio.wait_for(ev.wait(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        pass
                 continue
-            t0 = time.perf_counter()
+            last_pick = now
             try:
-                data, w, h, ts = await loop.run_in_executor(
-                    _executor, encode_jpeg, frame, quality, scale)
+                data, w, h, ts = await self._encoded(frame, quality, scale, cursor)
             except Exception:
                 await asyncio.sleep(0.1)
                 continue
-            last_ts = frame[3]
+            last_seq, last_params, last_cursor = frame[4], params, cursor
+            t0 = time.perf_counter()
             try:
                 await sess.ws.send_bytes(data)
             except (ConnectionError, RuntimeError):
                 break
+            send_dt = time.perf_counter() - t0
+            send_ewma = send_dt if not send_ewma else send_ewma * 0.7 + send_dt * 0.3
+            now2 = time.monotonic()
+            if send_ewma > budget * 1.4 and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
+                sess.net_degrade += 1
+                last_adapt = now2
+            elif send_ewma < budget * 0.4 and sess.net_degrade > 0 and now2 - last_adapt > 6.0:
+                sess.net_degrade -= 1
+                last_adapt = now2
             sess.frames += 1
             sess.bytes += len(data)
-            now = time.time()
-            if now - sess.last_bytes_ts >= 1.0:
-                sess.bitrate_mbps = sess.bytes * 8 / 1e6 / (now - sess.last_bytes_ts)
+            nowt = time.time()
+            if nowt - sess.last_bytes_ts >= 1.0:
+                sess.bitrate_mbps = sess.bytes * 8 / 1e6 / (nowt - sess.last_bytes_ts)
                 sess.bytes = 0
-                sess.last_bytes_ts = now
-            spent = time.perf_counter() - t0
-            await asyncio.sleep(max(0.0, 1.0 / max(fps, 1) - spent))
+                sess.last_bytes_ts = nowt
 
     async def _stats_sender(self, sess):
         while not sess.ws.closed:
-            load = hwinfo.get_load()
-            fps, quality, scale = sess.effective()
+            load = await self._get_load()
+            fps, quality, scale = self._stream_params(sess)
             user = auth.get_user(sess.username) or sess.user
             warn = list(sess.warnings)
             if sess.degrade > 0:
                 warn.append(f"Хост перегружен: применена ступень деградации {sess.degrade} "
                             f"(битрейт → FPS → разрешение)")
+            if sess.net_degrade > 0:
+                warn.append(f"Канал не успевает за потоком (ступень {sess.net_degrade}): "
+                            f"качество временно снижено. Помогут меньший FPS/масштаб "
+                            f"или кабельное подключение.")
             try:
                 await sess.ws.send_json({
                     "type": "stats", "host": load,
                     "session": sess.info(),
-                    "codec": "MJPEG", "route": sess.route,
+                    "codec": "MJPEG", "capture": self.capture.backend,
+                    "route": sess.route,
                     "fps_target": fps, "quality": quality, "scale": scale,
                     "permissions": self._permission_payload(user),
                     "warnings": warn,
                 })
             except (ConnectionError, RuntimeError):
                 break
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
 
     async def _kick(self, sess, reason):
         sess.kick_reason = reason
@@ -686,14 +955,15 @@ class HostServer:
         по возрастанию приоритета."""
         while True:
             await asyncio.sleep(3.0)
-            load = hwinfo.get_load()
+            self._refresh_capture_fps()
+            load = await self._get_load()
             reserve = self.config.get("owner_reserve_percent", 25)
             if self.config.get("owner_gaming_mode"):
                 reserve = max(reserve, 50)
             threshold = 100 - reserve
             ordered = sorted(self.sessions.values(),
                              key=lambda s: PRIORITY_ORDER.get(s.priority, 1))
-            if load["cpu_percent"] > threshold or load["ram_percent"] > 92:
+            if load.get("cpu_percent", 0) > threshold or load.get("ram_percent", 0) > 92:
                 for s in ordered:  # деградируем самых низкоприоритетных первыми
                     if s.degrade < 4:
                         s.degrade += 1
@@ -701,7 +971,7 @@ class HostServer:
                             s.warnings = ["Критическая перегрузка: сессия будет "
                                           "приостановлена при сохранении нагрузки"]
                         break
-            elif load["cpu_percent"] < threshold - 15:
+            elif load.get("cpu_percent", 0) < threshold - 15:
                 for s in reversed(ordered):  # восстанавливаем самых приоритетных первыми
                     if s.degrade > 0:
                         s.degrade -= 1
@@ -778,5 +1048,13 @@ class HostServer:
 
 
 def run(config):
+    if hwinfo.IS_WIN:
+        # Таймер Windows по умолчанию тикает ~15.6 мс — asyncio.sleep(мелкие
+        # паузы пейсинга) округляется вверх и режет FPS вдвое. 1 мс — как у
+        # всех стриминговых/игровых приложений.
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
     server = HostServer(config)
     web.run_app(server.app, host="0.0.0.0", port=config["host_port"], print=None)

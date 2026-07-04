@@ -272,6 +272,7 @@ async function loadUsers() {
       <td class="row">
         <button class="sec small" onclick="setUserInput('${u.username}', ${!u.allow_input})">${u.allow_input?'Запретить ввод':'Разрешить ввод'}</button>
         <button class="sec small" onclick="resetPw('${u.username}')">Сбросить пароль</button>
+        <button class="sec small" onclick="resetCode('${u.username}')" title="Одноразовый код: пользователь сам задаст новый пароль на экране подключения клиента">Код сброса</button>
         <button class="sec small" onclick="blockUser('${u.username}', ${!u.blocked})">${u.blocked?'Разблокировать':'Блокировать'}</button>
         ${u.role!=='owner' ? `<button class="danger small" onclick="delUser('${u.username}')">Удалить</button>` : ''}
       </td>`;
@@ -295,6 +296,13 @@ async function resetPw(username) {
   try { await api('/api/users/password', {username, password: pw});
     alert('Пароль изменён. Прежние токены входа отозваны, активные сессии не тронуты.'); }
   catch(e) { alert('Ошибка: ' + e.message); }
+}
+async function resetCode(username) {
+  try {
+    const d = await api('/api/reset/create', {username});
+    alert('Одноразовый код сброса пароля для «' + username + '» (действует 1 час):\n\n' + d.code +
+          '\n\nПользователь вводит его на экране подключения клиента («Забыли пароль?») и задаёт новый пароль сам.');
+  } catch(e) { alert('Ошибка: ' + e.message); }
 }
 async function setUserInput(username, allow) {
   await api('/api/users/update', {username, fields:{allow_input: allow}});

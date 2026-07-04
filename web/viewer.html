@@ -6,9 +6,12 @@
 <style>
 :root { --bg:#0a0d13; --fg:#e6e9f0; --acc:#4f8cff; --ok:#3ecf8e; --warn:#f5b545; --err:#f0564f; }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--fg); font:13px "Segoe UI",system-ui,sans-serif; overflow:hidden; }
-#stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
-canvas { max-width:100vw; max-height:100vh; outline:none; cursor:none; }
+body { margin:0; background:#000; color:var(--fg); font:13px "Segoe UI",system-ui,sans-serif; overflow:hidden; }
+#stage { position:fixed; inset:0; background:#000; }
+canvas {
+  width:100%; height:100%; display:block; object-fit:contain;
+  outline:none; cursor:none; background:#000;
+}
 #remoteCursor {
   position:fixed; left:0; top:0; width:18px; height:24px; z-index:18;
   pointer-events:none; display:none; transform:translate(-100px,-100px);
@@ -30,10 +33,10 @@ canvas { max-width:100vw; max-height:100vh; outline:none; cursor:none; }
   position:fixed; top:0; left:50%; transform:translateX(-50%);
   display:flex; gap:6px; padding:6px 10px; background:rgba(14,17,23,.92);
   border:1px solid #2a3245; border-top:0; border-radius:0 0 10px 10px; z-index:20;
-  transition:opacity .3s; align-items:center;
+  transition:opacity .35s, transform .35s; align-items:center;
 }
-#toolbar.hidden { opacity:.08; }
-#toolbar:hover { opacity:1; }
+#toolbar.hidden { opacity:0; transform:translateX(-50%) translateY(-85%); }
+#toolbar.hidden:hover, #toolbar:hover { opacity:1; transform:translateX(-50%); }
 button, select {
   background:#1e2534; color:var(--fg); border:1px solid #2a3245;
   border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer;
@@ -76,7 +79,7 @@ button.danger { background:var(--err); border-color:var(--err); }
   <button id="btnInput" onclick="toggleInput()">⌨️ Ввод: вкл</button>
   <button onclick="clipSend()" id="btnClipS" title="Отправить буфер обмена на хост">📋→</button>
   <button onclick="clipGet()" id="btnClipG" title="Получить буфер обмена хоста">→📋</button>
-  <button onclick="document.documentElement.requestFullscreen()">⛶</button>
+  <button id="btnFs" onclick="toggleFs()" title="Полноэкранный режим">⛶</button>
   <button class="danger" onclick="disconnect()">✕ Отключиться</button>
 </div>
 
@@ -88,6 +91,7 @@ const HOST = P.get('host'), PORT = P.get('port'), TOKEN = P.get('token');
 const $ = s => document.querySelector(s);
 const cv = $('#cv'), ctx = cv.getContext('2d');
 const remoteCursor = $('#remoteCursor');
+const toolbar = $('#toolbar');
 
 let ws, hello = null, lastStats = null;
 let inputEnabled = true, overlayOn = true;
@@ -97,7 +101,7 @@ let permissions = {input:false, clipboard:false};
 let frames = 0, fpsShown = 0, bytesAcc = 0, bitrate = 0;
 let rtts = [], ping = 0, jitter = 0;
 let decodeMs = 0, frameGapMs = 0, lastFrameT = 0;
-let framesDropped = 0;
+let framesDropped = 0;   // устаревшие кадры, отброшенные декодером (не декодировались)
 
 $('#selFps').value = P.get('fps') || '60';
 $('#selQ').value = P.get('quality') || '70';
@@ -116,52 +120,67 @@ function connect() {
 
 function showMsg(t, sub) {
   $('#msg').style.display = ''; $('#stage').style.display = 'none';
-  $('#toolbar').style.display = 'none';
+  toolbar.style.display = 'none';
   $('#msgText').textContent = t; $('#msgSub').textContent = sub || '';
 }
 
-async function onMsg(e) {
-  if (typeof e.data === 'string') {
-    const d = JSON.parse(e.data);
-    if (d.type === 'hello') {
-      hello = d;
-      applyPermissions(d.permissions || {});
-      document.title = `App_Remote — ${d.host_name}`;
-      $('#msg').style.display = 'none';
-      $('#stage').style.display = ''; $('#toolbar').style.display = 'flex';
-      $('#btnClipS').style.display = permissions.clipboard ? '' : 'none';
-      $('#btnClipG').style.display = permissions.clipboard ? '' : 'none';
-      cv.focus();
-      renderOverlay();
-    } else if (d.type === 'pong') {
-      const rtt = performance.now() - d.t;
-      rtts.push(rtt); if (rtts.length > 20) rtts.shift();
-      ping = rtts.reduce((a,b)=>a+b,0) / rtts.length;
-      const mean = ping;
-      jitter = Math.sqrt(rtts.reduce((a,b)=>a+(b-mean)**2,0) / rtts.length);
-    } else if (d.type === 'stats') {
-      lastStats = d;
-      if (d.permissions) applyPermissions(d.permissions);
-    } else if (d.type === 'clipboard') {
-      try { await navigator.clipboard.writeText(d.text); } catch(_){}
-    } else if (d.type === 'kick') {
-      showMsg('Сессия завершена', d.reason);
-    }
-    return;
-  }
-  // бинарный кадр JPEG
+// ---- декодирование: держим только самый свежий кадр, старые отбрасываем.
+// Иначе при медленном декодере очередь растёт и картинка отстаёт всё сильнее.
+let pendingFrame = null, decoding = false;
+
+function onMsg(e) {
+  if (typeof e.data === 'string') { onText(JSON.parse(e.data)); return; }
   bytesAcc += e.data.byteLength;
-  const t0 = performance.now();
-  try {
-    const bmp = await createImageBitmap(new Blob([e.data], {type:'image/jpeg'}));
-    if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
-    ctx.drawImage(bmp, 0, 0);
-    bmp.close();
-    decodeMs = performance.now() - t0;
-    if (lastFrameT) frameGapMs = t0 - lastFrameT;
-    lastFrameT = t0;
-    frames++;
-  } catch(_) { framesDropped++; }
+  if (pendingFrame) framesDropped++;   // не успели декодировать предыдущий
+  pendingFrame = e.data;
+  if (!decoding) drainFrames();
+}
+
+async function drainFrames() {
+  decoding = true;
+  while (pendingFrame) {
+    const buf = pendingFrame; pendingFrame = null;
+    const t0 = performance.now();
+    try {
+      const bmp = await createImageBitmap(new Blob([buf], {type:'image/jpeg'}));
+      if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close();
+      decodeMs = performance.now() - t0;
+      if (lastFrameT) frameGapMs = t0 - lastFrameT;
+      lastFrameT = t0;
+      frames++;
+    } catch(_) { framesDropped++; }
+  }
+  decoding = false;
+}
+
+async function onText(d) {
+  if (d.type === 'hello') {
+    hello = d;
+    applyPermissions(d.permissions || {});
+    document.title = `App_Remote — ${d.host_name}`;
+    $('#msg').style.display = 'none';
+    $('#stage').style.display = ''; toolbar.style.display = 'flex';
+    $('#btnClipS').style.display = permissions.clipboard ? '' : 'none';
+    $('#btnClipG').style.display = permissions.clipboard ? '' : 'none';
+    cv.focus();
+    pokeToolbar();
+    renderOverlay();
+  } else if (d.type === 'pong') {
+    const rtt = performance.now() - d.t;
+    rtts.push(rtt); if (rtts.length > 20) rtts.shift();
+    ping = rtts.reduce((a,b)=>a+b,0) / rtts.length;
+    const mean = ping;
+    jitter = Math.sqrt(rtts.reduce((a,b)=>a+(b-mean)**2,0) / rtts.length);
+  } else if (d.type === 'stats') {
+    lastStats = d;
+    if (d.permissions) applyPermissions(d.permissions);
+  } else if (d.type === 'clipboard') {
+    try { await navigator.clipboard.writeText(d.text); } catch(_){}
+  } else if (d.type === 'kick') {
+    showMsg('Сессия завершена', d.reason);
+  }
 }
 
 // секундомер метрик
@@ -186,19 +205,17 @@ function renderOverlay() {
     <span class="badge ${routeCls}">${route}</span> <b>${hello ? hello.host_name : ''}</b>
     <div class="sec">ПОТОК</div>
     FPS: <b>${fpsShown}</b> (цель ${s.fps_target ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
-    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>${s.codec || 'MJPEG'}</b><br>
-    Разрешение: <b>${cv.width}×${cv.height}</b> · HDR: <b>нет (MVP)</b><br>
+    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>${s.codec || 'MJPEG'}</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI (быстрый)' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
+    Разрешение: <b>${cv.width}×${cv.height}</b> · Статичный экран не передаётся<br>
     Профиль: <b>${sess.profile || $('#selProfile').value}</b> · Q${s.quality ?? '—'}
     <div class="sec">ЗАДЕРЖКИ</div>
     Ping: <b>${ping.toFixed(1)} мс</b> · Jitter: <b>${jitter.toFixed(1)} мс</b><br>
     Ввод (оценка): <b>~${inputLat} мс</b> · Декодирование: <b>${decodeMs.toFixed(1)} мс</b><br>
-    Потери: <b>${framesDropped} кадров</b> <span style="color:#8b93a7">(транспорт TCP — пакеты не теряются, но возможны задержки)</span>
+    Пропущено декодером: <b>${framesDropped}</b> <span style="color:#8b93a7">(показывается только самый свежий кадр)</span>
     <div class="sec">ХОСТ</div>
     CPU: <b>${h.cpu_percent ?? '—'}%</b> · RAM: <b>${h.ram_percent ?? '—'}%</b><br>
     GPU: <b>${h.gpu_percent ?? 'н/д'}%</b> · VRAM: <b>${h.vram_percent ?? 'н/д'}%</b>
     ${inputWarn}
-    <div class="sec">КЛИЕНТ</div>
-    Декодер: <b>Canvas/CPU</b> · Вкладка FPS-цель: <b>${$('#selFps').value}</b>
     ${warn}`;
 }
 
@@ -207,6 +224,10 @@ function toggleInput() {
   if (!permissions.input) return;
   inputEnabled = !inputEnabled;
   updateInputButton();
+}
+function toggleFs() {
+  if (document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  else document.documentElement.requestFullscreen().catch(()=>{});
 }
 function disconnect() { if (ws) ws.close(); showMsg('Отключено', 'Можно закрыть вкладку'); }
 
@@ -250,6 +271,15 @@ function applyProfile() {
   sendConfig();
 }
 
+// ---- автоскрытие тулбара: пропадает через 2.5 с без движения мыши
+let tbTimer = null;
+function pokeToolbar() {
+  toolbar.classList.remove('hidden');
+  clearTimeout(tbTimer);
+  tbTimer = setTimeout(() => toolbar.classList.add('hidden'), 2500);
+}
+document.addEventListener('mousemove', pokeToolbar);
+
 // -------- ввод --------
 let evQueue = [];
 setInterval(() => {
@@ -259,21 +289,51 @@ setInterval(() => {
   evQueue = [];
 }, 16);
 
-function norm(e) {
+// canvas растянут с object-fit:contain — по бокам могут быть чёрные поля.
+// Координаты нормируем к фактической области изображения, а не ко всему канвасу.
+function contentRect() {
   const r = cv.getBoundingClientRect();
-  return {x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
-          y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))};
+  if (!cv.width || !cv.height || !r.width || !r.height) return {x:r.left, y:r.top, w:r.width||1, h:r.height||1};
+  const ar = cv.width / cv.height, rr = r.width / r.height;
+  if (rr > ar) {
+    const h = r.height, w = h * ar;
+    return {x: r.left + (r.width - w) / 2, y: r.top, w, h};
+  }
+  const w = r.width, h = w / ar;
+  return {x: r.left, y: r.top + (r.height - h) / 2, w, h};
+}
+function insideContent(e) {
+  const c = contentRect();
+  return e.clientX >= c.x && e.clientX <= c.x + c.w && e.clientY >= c.y && e.clientY <= c.y + c.h;
+}
+function norm(e) {
+  const c = contentRect();
+  return {x: Math.min(1, Math.max(0, (e.clientX - c.x) / c.w)),
+          y: Math.min(1, Math.max(0, (e.clientY - c.y) / c.h))};
 }
 function moveLocalCursor(e) {
+  if (!insideContent(e)) { remoteCursor.style.display = 'none'; return; }
   remoteCursor.style.display = '';
   remoteCursor.style.transform = `translate(${e.clientX}px, ${e.clientY}px)`;
 }
 cv.addEventListener('mouseenter', e => { moveLocalCursor(e); updateInputButton(); });
 cv.addEventListener('mouseleave', () => { remoteCursor.style.display = 'none'; });
-cv.addEventListener('mousemove', e => { moveLocalCursor(e); const p = norm(e); evQueue.push({t:'mm', x:p.x, y:p.y}); });
-cv.addEventListener('mousedown', e => { e.preventDefault(); const p = norm(e); evQueue.push({t:'mm',x:p.x,y:p.y},{t:'mb',b:e.button,d:1}); cv.focus(); });
-cv.addEventListener('mouseup',   e => { e.preventDefault(); evQueue.push({t:'mb', b:e.button, d:0}); });
-cv.addEventListener('wheel',     e => { e.preventDefault(); evQueue.push({t:'wh', dy:e.deltaY}); }, {passive:false});
+cv.addEventListener('mousemove', e => {
+  moveLocalCursor(e);
+  if (inputEnabled && insideContent(e)) { const p = norm(e); evQueue.push({t:'mm', x:p.x, y:p.y}); }
+});
+cv.addEventListener('mousedown', e => {
+  e.preventDefault(); cv.focus();
+  if (inputEnabled && insideContent(e)) { const p = norm(e); evQueue.push({t:'mm',x:p.x,y:p.y},{t:'mb',b:e.button,d:1}); }
+});
+cv.addEventListener('mouseup', e => {
+  e.preventDefault();
+  if (inputEnabled) evQueue.push({t:'mb', b:e.button, d:0});
+});
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (inputEnabled) evQueue.push({t:'wh', dy:e.deltaY});
+}, {passive:false});
 cv.addEventListener('contextmenu', e => e.preventDefault());
 cv.addEventListener('keydown', e => { if (!inputEnabled) return; e.preventDefault(); evQueue.push({t:'kb', k:e.key, d:1}); });
 cv.addEventListener('keyup',   e => { if (!inputEnabled) return; e.preventDefault(); evQueue.push({t:'kb', k:e.key, d:0}); });
