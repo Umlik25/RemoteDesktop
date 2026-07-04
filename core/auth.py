@@ -14,6 +14,7 @@ from . import state
 
 USERS_PATH = os.path.join(state.DATA_DIR, "users.json")
 INVITES_PATH = os.path.join(state.DATA_DIR, "invites.json")
+RESET_PATH = os.path.join(state.DATA_DIR, "reset_codes.json")
 
 ROLES = ("owner", "admin", "user", "guest")
 PROFILES = ("office", "dev", "design", "video", "game", "competitive", "custom")
@@ -213,6 +214,39 @@ def revoke_invite(code, actor="system"):
         inv.pop(code, None)
         _save(INVITES_PATH, inv)
     state.audit("invite.revoke", actor, {"code": code})
+
+
+# ---- Коды сброса пароля (одноразовые) ----
+
+def create_reset_code(username, ttl_hours=1.0, actor="system"):
+    """Одноразовый код сброса пароля. Создаёт владелец/админ на хосте,
+    пользователь вводит его на экране подключения клиента."""
+    with _lock:
+        users = _load(USERS_PATH)
+        if username not in users:
+            raise ValueError("Нет такого пользователя")
+        now = time.time()
+        codes = {c: v for c, v in _load(RESET_PATH).items()
+                 if not v.get("used") and now < v.get("expires_at", 0)}
+        code = secrets.token_urlsafe(6)
+        codes[code] = {"username": username, "expires_at": now + ttl_hours * 3600,
+                       "used": False, "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+        _save(RESET_PATH, codes)
+    state.audit("reset_code.create", actor, {"username": username, "ttl_hours": ttl_hours})
+    return code
+
+
+def redeem_reset_code(code, new_password):
+    """Погасить код: меняет пароль только этому пользователю, ничего не сбрасывая."""
+    with _lock:
+        codes = _load(RESET_PATH)
+        rec = codes.get(code)
+        if not rec or rec.get("used") or time.time() > rec["expires_at"]:
+            raise ValueError("Код недействителен или истёк")
+        rec["used"] = True
+        _save(RESET_PATH, codes)
+    set_password(rec["username"], new_password, actor=f"reset-code:{code[:4]}…")
+    return rec["username"]
 
 
 def redeem_invite(code, username, password):

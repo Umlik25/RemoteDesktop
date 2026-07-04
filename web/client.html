@@ -39,9 +39,19 @@
   <div class="tabs">
     <button id="tabLogin" class="active" onclick="swMode('login')">Вход</button>
     <button id="tabInvite" onclick="swMode('invite')">У меня код приглашения</button>
+    <button id="tabReset" onclick="swMode('reset')">Забыли пароль?</button>
   </div>
   <div id="mInvite" style="display:none">
     <label class="f">Код приглашения<input id="cInvCode"></label>
+  </div>
+  <div id="mReset" style="display:none">
+    <p class="muted">Попросите владельца/администратора хоста создать <b>код сброса</b>
+    (панель хоста → Пользователи → «Код сброса»). Введите его и задайте новый пароль —
+    остальные данные и активные сессии не пострадают.</p>
+    <label class="f">Код сброса<input id="cResetCode"></label>
+    <label class="f">Новый пароль (мин. 4 символа)<input id="cResetPass" type="password"></label>
+    <div class="row"><button onclick="doReset()">Сменить пароль</button></div>
+    <hr style="border-color:var(--line)">
   </div>
   <label class="f">Имя пользователя<input id="cUser"></label>
   <label class="f">Пароль<input id="cPass" type="password"></label>
@@ -75,8 +85,27 @@ let hosts = [], current = null, mode = 'login';
 function swMode(m) {
   mode = m;
   $('#mInvite').style.display = m === 'invite' ? '' : 'none';
+  $('#mReset').style.display = m === 'reset' ? '' : 'none';
   $('#tabLogin').classList.toggle('active', m === 'login');
   $('#tabInvite').classList.toggle('active', m === 'invite');
+  $('#tabReset').classList.toggle('active', m === 'reset');
+}
+
+async function doReset() {
+  const {ip, port} = current;
+  $('#cErr').textContent = '';
+  try {
+    const r = await fetch(`http://${ip}:${port}/api/reset/redeem`, {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({code: $('#cResetCode').value.trim(), password: $('#cResetPass').value})});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    $('#cUser').value = d.username;
+    $('#cPass').value = $('#cResetPass').value;
+    swMode('login');
+    $('#cErr').style.color = 'var(--ok)';
+    $('#cErr').textContent = 'Пароль обновлён для «' + d.username + '» — нажмите «Подключиться».';
+  } catch(e) { $('#cErr').style.color = 'var(--err)'; $('#cErr').textContent = e.message; }
 }
 
 async function loadHosts() {
