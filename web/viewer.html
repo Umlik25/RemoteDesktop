@@ -19,8 +19,14 @@ canvas#cv {
   transition:opacity .35s, transform .35s; align-items:center; justify-content:center;
   flex-wrap:wrap; width:max-content; max-width:98vw;
 }
-#toolbar.hidden { opacity:0; transform:translateX(-50%) translateY(-85%); }
-#toolbar.hidden:hover, #toolbar:hover { opacity:1; transform:translateX(-50%); }
+#toolbar.hidden { opacity:0; transform:translateX(-50%) translateY(-110%); pointer-events:none; }
+#toolbarReveal {
+  position:fixed; top:0; left:50%; transform:translateX(-50%) translateY(-120%);
+  z-index:21; opacity:0; pointer-events:none; transition:opacity .2s, transform .2s;
+  border-radius:0 0 7px 7px; padding:2px 12px;
+}
+#toolbarReveal.show { opacity:.8; pointer-events:auto; transform:translateX(-50%); }
+#toolbarReveal:hover { opacity:1; }
 button, select {
   background:#1e2534; color:var(--fg); border:1px solid #2a3245;
   border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer;
@@ -89,13 +95,14 @@ dialog::backdrop { background:rgba(0,0,0,.7); }
   <select id="selDesktop" onchange="sendConfig()" title="Системное разрешение общего рабочего стола Windows" style="display:none">
     <option value="host">Рабочий стол: хост</option>
     <option value="client">Рабочий стол: мой экран</option>
+    <option value="viewport">Рабочий стол: моё окно</option>
   </select>
   <select id="selAdaptive" onchange="sendConfig()" title="Авто снижает параметры при проблемах сети; фиксированный режим сохраняет выбранные значения">
     <option value="auto">Авто</option><option value="fixed">Фикс.</option>
   </select>
   <span id="streamStatus" class="badge b-acc" title="Параметры потока">Ожидание хоста…</span>
   <button id="btnInput" onclick="toggleInput()">⌨️ Ввод: вкл</button>
-  <button id="btnKeys" onclick="toggleKeyMode()" title="Текст: печатает символы как есть (любая раскладка, точки, кириллица). Игра: клавиши как физические кнопки (WASD с удержанием).">⌨️ Набор: текст</button>
+  <button id="btnKeys" onclick="toggleKeyMode()" title="Работа: обычная мышь с ускорением и Unicode-набор. Игра: сырой относительный ввод мыши без ускорения и физические клавиши.">⌨️ Режим: работа</button>
   <button id="btnCapture" onclick="toggleCaptureMode()" title="Захват мыши: курсор не выходит за окно и не задевает меню/док Mac. Выход: удерживайте Esc.">🔒 Захват</button>
   <button id="btnMac" onclick="toggleMac()" title="Раскладка Mac→Windows: клавиша ⌘ (Cmd) работает как Ctrl (⌘C = копировать и т.п.)">⌘→Ctrl</button>
   <button onclick="langSwitch()" title="Переключить язык ввода НА ХОСТЕ (Win+Space). Для набора текста обычно не нужно — печатайте в своей раскладке.">🌐</button>
@@ -103,8 +110,10 @@ dialog::backdrop { background:rgba(0,0,0,.7); }
   <button onclick="clipGet()" id="btnClipG" title="Получить буфер обмена хоста">→📋</button>
   <button onclick="openFiles()" id="btnFiles" title="Личные файлы на хосте" style="display:none">📁 Файлы</button>
   <button id="btnFs" onclick="toggleFs()" title="Полноэкранный режим">⛶</button>
+  <button id="btnToolbarHide" onclick="hideToolbar()" title="Свернуть панель">⌃</button>
   <button class="danger" onclick="disconnect()">✕ Отключиться</button>
 </div>
+<button id="toolbarReveal" onclick="showToolbar()" title="Показать панель">⌄</button>
 
 <div id="hint"></div>
 <div id="overlay"></div>
@@ -182,7 +191,8 @@ ensureSelectValue($('#selFps'), P.get('fps') || '60');
 ensureSelectValue($('#selQ'), P.get('quality') || '70', `Q${P.get('quality')}`);
 $('#selProfile').value = P.get('profile') || 'dev';
 $('#selAdaptive').value = P.get('adaptive') === '0' ? 'fixed' : 'auto';
-$('#selDesktop').value = P.get('desktop') === 'client' ? 'client' : 'host';
+$('#selDesktop').value = ['client','viewport'].includes(P.get('desktop')) ? P.get('desktop') : 'host';
+updateDesktopOptions();
 
 // ================== КУРСОР: рисуется ПРЯМО В CANVAS ==================
 // Никаких DOM-слоёв: курсор компонуется с кадром при отрисовке, поэтому он
@@ -204,6 +214,41 @@ for (const [type, c] of Object.entries(CURSOR_SVGS)) {
   const img = new Image();
   img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(c.svg);
   cursorImgs[type] = img;
+}
+function pixelSize(width, height, dpr) {
+  const w = Math.max(1, Math.round((Number(width) || 1) * dpr));
+  const h = Math.max(1, Math.round((Number(height) || 1) * dpr));
+  return {width:w, height:h};
+}
+function clientDisplayInfo() {
+  const dpr = Number(window.devicePixelRatio) > 0 ? Number(window.devicePixelRatio) : 1;
+  const viewport = window.visualViewport;
+  const vw = (viewport && viewport.width) || window.innerWidth || document.documentElement.clientWidth;
+  const vh = (viewport && viewport.height) || window.innerHeight || document.documentElement.clientHeight;
+  return {
+    dpr,
+    screen: pixelSize(window.screen.width, window.screen.height, dpr),
+    available: pixelSize(window.screen.availWidth || window.screen.width,
+                         window.screen.availHeight || window.screen.height, dpr),
+    viewport: pixelSize(vw, vh, dpr),
+    css_screen: {width:Math.round(window.screen.width), height:Math.round(window.screen.height)},
+  };
+}
+function sizeText(size) { return `${size.width}×${size.height}`; }
+function updateDesktopOptions(state=displayState) {
+  const info = clientDisplayInfo();
+  const select = $('#selDesktop');
+  const host = select.querySelector('option[value="host"]');
+  const screenOption = select.querySelector('option[value="client"]');
+  const viewportOption = select.querySelector('option[value="viewport"]');
+  host.textContent = 'Рабочий стол: хост';
+  screenOption.textContent = `Экран ${sizeText(info.screen)}`;
+  viewportOption.textContent = `Окно ${sizeText(info.viewport)}`;
+  if (state && state.selected && state.mode === 'client') {
+    screenOption.textContent += ` → Windows ${sizeText(state.selected)}`;
+  } else if (state && state.selected && state.mode === 'viewport') {
+    viewportOption.textContent += ` → Windows ${sizeText(state.selected)}`;
+  }
 }
 function nativeWH() { return desktopWH || (hello && hello.screen) || [cv.width || 1, cv.height || 1]; }
 function contentRect() {
@@ -277,6 +322,7 @@ function connect() {
 function showMsg(t, sub) {
   $('#msg').style.display = ''; $('#stage').style.display = 'none';
   toolbar.style.display = 'none';
+  $('#toolbarReveal').classList.remove('show');
   $('#msgText').textContent = t; $('#msgSub').textContent = sub || '';
 }
 let hintTimer = null;
@@ -448,16 +494,17 @@ function renderOverlay() {
   const deltaShare = total ? Math.round(deltaCnt * 100 / total) : 0;
   const ackLag = sess.ack_latency_ms != null ? Number(sess.ack_latency_ms).toFixed(1) : '—';
   const desktop = (displayState && displayState.current) || {};
+  const clientDisplay = clientDisplayInfo();
   ov.innerHTML = `
     <span class="badge ${routeCls}">${esc(route)}</span> <b>${esc(hello ? hello.host_name : '')}</b>
     <div class="sec">ПОТОК</div>
     FPS: <b>${fpsShown}</b> (применено ${applied.fps ?? s.fps_target ?? $('#selFps').value}, выбрано ${selected.fps ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
     Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>MJPEG-дельта</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
-    Поток: <b>${cv.width}×${cv.height}</b> · Мой экран: <b>${Math.round(screen.width*(devicePixelRatio||1))}×${Math.round(screen.height*(devicePixelRatio||1))}</b><br>
+    Поток: <b>${cv.width}×${cv.height}</b> · Экран: <b>${sizeText(clientDisplay.screen)}</b> · Окно: <b>${sizeText(clientDisplay.viewport)}</b><br>
     Рабочий стол Windows: <b>${desktop.width ? desktop.width + '×' + desktop.height : '—'}</b> · Очередь: <b>${sess.client_queue ?? frameQueue.length}</b><br>
     Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>
     Профиль: <b>${esc(sess.profile || $('#selProfile').value)}</b> · Q${esc(applied.quality ?? s.quality ?? '—')} (выбрано Q${esc(selected.quality ?? $('#selQ').value)}) · Адаптация: <b>${selected.adaptive === false ? 'фикс.' : 'авто'}</b><br>
-    Режим: <b>${modeTxt}</b> · Набор: <b>${keyMode === 'text' ? 'текст' : 'игра'}</b>
+    Режим: <b>${modeTxt}</b> · Ввод: <b>${keyMode === 'text' ? 'работа · ускорение' : 'игра · raw'}</b>
     <div class="sec">ЗАДЕРЖКИ</div>
     Ping: <b>${ping.toFixed(1)} мс</b> · Jitter: <b>${jitter.toFixed(1)} мс</b><br>
     Ввод (оценка): <b>~${inputLat} мс</b> · Декодирование: <b>${decodeMs.toFixed(1)} мс</b><br>
@@ -554,14 +601,15 @@ function applyDisplayState(state, authoritative=true) {
   const sel = $('#selDesktop');
   sel.style.display = state.available ? '' : 'none';
   sel.disabled = !state.allowed;
-  if (authoritative && (initialConfigSent || P.get('desktop') !== 'client')) {
-    sel.value = state.mode === 'client' ? 'client' : 'host';
+  if (authoritative && (initialConfigSent || !['client','viewport'].includes(P.get('desktop')))) {
+    sel.value = ['client','viewport'].includes(state.mode) ? state.mode : 'host';
   }
   sel.title = !state.available
     ? 'Системное разрешение доступно только на Windows-хосте'
     : !state.allowed
       ? 'Владелец хоста не разрешил менять общий дисплей'
       : 'Меняет системное разрешение общего рабочего стола Windows; при отключении оно восстановится';
+  updateDesktopOptions(state);
   const after = desktopWH && desktopWH.join('x');
   if (resolutionBuilt && before !== after) buildResSelect(false);
 }
@@ -577,13 +625,12 @@ function buildResSelect(send=true) {
     return o;
   };
   add(`Родное хоста ${nw}×${nh}`, '1');
-  // Подбираем поток под физическую высоту экрана клиента, сохраняя пропорции хоста.
-  const dpr = window.devicePixelRatio || 1;
-  const clientH = Math.round(screen.height * dpr);
+  // Для оконного режима не кодируем пиксели, которые браузер всё равно уменьшит.
+  const clientH = clientDisplayInfo().viewport.height;
   if (clientH && nh) {
     const scale = Math.max(0.25, Math.min(1, clientH / nh));
     const [w, h] = streamDimensions(scale);
-    add(`Под мой экран ${w}×${h}${scale >= 1 ? ' · макс' : ''}`, scale);
+    add(`Под окно ${w}×${h}${scale >= 1 ? ' · макс' : ''}`, scale);
   }
   for (const [, h] of RES_LIST) {
     if (!nh || h >= nh) continue;
@@ -645,7 +692,10 @@ function requestPL() {
   const [nw, nh] = nativeWH();
   vx = clamp(hostCursorPos.x / nw); vy = clamp(hostCursorPos.y / nh);  // старт без скачка
   try {
-    const p = cv.requestPointerLock({unadjustedMovement: true});   // без ускорения ОС
+    // Рабочий режим сохраняет привычную акселерацию ОС. Игровой просит
+    // сырые hardware-delta и передаёт их на хост как относительный SendInput.
+    const p = keyMode === 'game'
+      ? cv.requestPointerLock({unadjustedMovement: true}) : cv.requestPointerLock();
     if (p && p.catch) p.catch(() => { try { cv.requestPointerLock(); } catch(_){} });
   } catch(_) { try { cv.requestPointerLock(); } catch(_){} }
 }
@@ -683,7 +733,7 @@ document.addEventListener('pointerlockchange', () => {
   captured = document.pointerLockElement === cv;
   if (captured) {
     releaseAll();
-    toolbar.classList.add('hidden');
+    hideToolbar();
     hint(kbLocked ? 'Захвачено · Esc уходит в Windows · удерживайте Esc для выхода'
                   : 'Захвачено · Esc уходит в Windows · кнопка «Захват» — выход', 3500);
   } else {
@@ -710,12 +760,16 @@ function updateMacButton() {
 }
 function toggleKeyMode() {
   keyMode = keyMode === 'text' ? 'game' : 'text';
+  pointerLastT = 0;
   releaseAll(); updateKeysButton();
 }
 function updateKeysButton() {
   const b = $('#btnKeys');
-  b.textContent = keyMode === 'text' ? '⌨️ Набор: текст' : '🎮 Набор: игра';
+  b.textContent = keyMode === 'text' ? '⌨️ Режим: работа' : '🎮 Режим: игра';
   b.classList.toggle('on', keyMode === 'game');
+  b.title = keyMode === 'text'
+    ? 'Рабочий ввод: обычная мышь с ускорением и Unicode-набор текста'
+    : 'Игровой ввод: сырые относительные движения мыши без ускорения и физические клавиши';
 }
 function langSwitch() { evQueue.push({t:'lang'}); flushNow(); hint('Хосту отправлено Win+Space (смена языка)', 2500); }
 
@@ -761,13 +815,14 @@ function sendConfig() {
     hint('Не удалось прочитать параметры потока', 4000); return;
   }
   const requestId = ++configSeq;
+  const clientDisplay = clientDisplayInfo();
   initialConfigSent = true;
   setStreamStatus(null, true);
   ws.send(JSON.stringify({type:'config', request_id:requestId, fps, quality, scale,
     profile:$('#selProfile').value, adaptive:$('#selAdaptive').value === 'auto',
     desktop_mode:$('#selDesktop').value,
-    client_width:Math.round(screen.width * (window.devicePixelRatio || 1)),
-    client_height:Math.round(screen.height * (window.devicePixelRatio || 1))}));
+    client_width:clientDisplay.screen.width, client_height:clientDisplay.screen.height,
+    client_display:clientDisplay}));
 }
 function manualConfigChanged() {
   $('#selProfile').value = 'custom';
@@ -784,20 +839,47 @@ function applyProfile() {
     selectScale(m[2]);
   }
   keyMode = (p === 'game' || p === 'competitive') ? 'game' : 'text';
+  pointerLastT = 0;
   releaseAll(); updateKeysButton();
   sendConfig();
 }
 
-// автоскрытие тулбара
+// Панель раскрывается только у верхнего края. Движение по рабочему столу
+// больше не удерживает её открытой.
 let tbTimer = null;
-function pokeToolbar() {
+function hideToolbar() {
+  clearTimeout(tbTimer);
+  toolbar.classList.add('hidden');
+  $('#toolbarReveal').classList.toggle('show', !captured);
+  positionOverlay();
+}
+function showToolbar() {
   if (captured) return;
   toolbar.classList.remove('hidden');
+  $('#toolbarReveal').classList.remove('show');
   positionOverlay();
   clearTimeout(tbTimer);
-  tbTimer = setTimeout(() => { toolbar.classList.add('hidden'); positionOverlay(); }, 2500);
+  tbTimer = setTimeout(hideToolbar, 3000);
 }
-document.addEventListener('mousemove', pokeToolbar);
+function pokeToolbar() { showToolbar(); }
+document.addEventListener('mousemove', e => {
+  if (!captured && e.clientY <= 10) showToolbar();
+});
+toolbar.addEventListener('mouseenter', () => clearTimeout(tbTimer));
+toolbar.addEventListener('mouseleave', () => { clearTimeout(tbTimer); tbTimer = setTimeout(hideToolbar, 1200); });
+
+let resizeTimer = null;
+function clientViewportChanged() {
+  updateDesktopOptions();
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (resolutionBuilt) buildResSelect(false);
+    if ($('#selDesktop').value === 'viewport') sendConfig();
+    renderOverlay();
+  }, 250);
+}
+window.addEventListener('resize', clientViewportChanged);
+if (window.visualViewport) window.visualViewport.addEventListener('resize', clientViewportChanged);
 
 // -------- ввод --------
 // Клики и клавиши уходят немедленно (без +16 мс задержки), движения мыши
@@ -816,6 +898,19 @@ function pushMove(x, y) {
   if (last && last.t === 'mm') { last.x = x; last.y = y; }
   else evQueue.push({t:'mm', x, y});
 }
+function pushRelative(dx, dy) {
+  const last = evQueue[evQueue.length - 1];
+  if (last && last.t === 'mr') { last.dx += dx; last.dy += dy; }
+  else evQueue.push({t:'mr', dx, dy});
+}
+let pointerLastT = 0;
+function acceleratedPointerDelta(dx, dy, now) {
+  const dt = pointerLastT ? Math.max(1, Math.min(50, now - pointerLastT)) : 16;
+  pointerLastT = now;
+  const speed = Math.hypot(dx, dy) / dt;
+  const gain = 1 + Math.min(1.2, Math.max(0, speed - 0.2) * 0.5);
+  return {dx:dx * gain, dy:dy * gain};
+}
 function insideContent(e) {
   const c = contentRect();
   return e.clientX >= c.x && e.clientX <= c.x + c.w && e.clientY >= c.y && e.clientY <= c.y + c.h;
@@ -828,9 +923,18 @@ function normAbs(e) {
 cv.addEventListener('mousemove', e => {
   if (captured) {
     const c = contentRect();
-    vx = clamp(vx + e.movementX / c.w);
-    vy = clamp(vy + e.movementY / c.h);
-    if (inputEnabled) pushMove(vx, vy);
+    if (keyMode === 'game') {
+      pointerLastT = 0;
+      const [nw, nh] = nativeWH();
+      vx = clamp(vx + e.movementX / nw);
+      vy = clamp(vy + e.movementY / nh);
+      if (inputEnabled) pushRelative(e.movementX, e.movementY);
+    } else {
+      const move = acceleratedPointerDelta(e.movementX, e.movementY, performance.now());
+      vx = clamp(vx + move.dx / c.w);
+      vy = clamp(vy + move.dy / c.h);
+      if (inputEnabled) pushMove(vx, vy);
+    }
   } else if (inputEnabled) {
     localMouse.x = e.clientX; localMouse.y = e.clientY;
     localOver = insideContent(e);

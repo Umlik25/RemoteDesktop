@@ -476,6 +476,30 @@ class InputInjector:
             y = int(ny * (self.screen_wh[1] - 1))
             self.mouse.position = (x, y)
 
+    def _mouse_move_relative(self, dx, dy):
+        """Перемещение 1:1 для игр, без повторного ускорения Windows."""
+        dx = max(-4096, min(4096, int(dx)))
+        dy = max(-4096, min(4096, int(dy)))
+        if not dx and not dy:
+            return
+        # Относительный MOUSEEVENTF_MOVE повторно проходит через системную
+        # акселерацию Windows. Абсолютная цель current + delta сохраняет
+        # полученную от Pointer Lock игровую дельту ровно 1:1.
+        if _SENDINPUT_OK and self.screen_wh and self.mouse:
+            try:
+                x, y = self.mouse.position
+                w, h = self.screen_wh
+                nx = max(0, min(w - 1, int(x) + dx)) / max(1, w - 1)
+                ny = max(0, min(h - 1, int(y) + dy)) / max(1, h - 1)
+                if _send_mouse(_MEF["move"] | _MEF["abs"],
+                               int(nx * 65535), int(ny * 65535)):
+                    return
+            except Exception:
+                pass
+        if self.mouse:
+            x, y = self.mouse.position
+            self.mouse.position = (int(x) + dx, int(y) + dy)
+
     def _mouse_button(self, b, down):
         if _SENDINPUT_OK:
             pairs = {0: ("ldown", "lup"), 1: ("mdown", "mup"), 2: ("rdown", "rup")}
@@ -510,6 +534,8 @@ class InputInjector:
             if t == "mm":
                 self._mouse_move(max(0.0, min(1.0, float(ev["x"]))),
                                  max(0.0, min(1.0, float(ev["y"]))))
+            elif t == "mr":
+                self._mouse_move_relative(ev.get("dx", 0), ev.get("dy", 0))
             elif t == "mb":
                 self._mouse_button(ev.get("b", 0), bool(ev.get("d")))
             elif t == "wh":
@@ -582,6 +608,7 @@ class Session:
         self.kick_reason = None
         self.desktop_mode = "host"
         self.desktop_size = None
+        self.desktop_target = None
         self.send_id = 0
         self.last_ack_id = 0
         self.ack_latency_ms = 0.0
@@ -981,13 +1008,14 @@ class HostServer:
             "mode": sess.desktop_mode if sess else "host",
             "current": current,
             "selected": sess.desktop_size if sess else None,
+            "target": sess.desktop_target if sess else None,
             "modes": modes,
             "shared": True,
         }
 
     async def _apply_display_config(self, sess, data, user):
         requested = data.get("desktop_mode")
-        if requested not in ("host", "client"):
+        if requested not in ("host", "client", "viewport"):
             return self._display_state(sess, user), []
         reasons = []
         manager = getattr(self, "display", None)
@@ -1010,6 +1038,7 @@ class HostServer:
                     self._display_owner = None
                     sess.desktop_mode = "host"
                     sess.desktop_size = None
+                    sess.desktop_target = None
                     self.capture.restart()
                     sess.force_full = True
                 else:
@@ -1022,10 +1051,9 @@ class HostServer:
         if display_owner is None and len(self.sessions) > 1:
             reasons.append("Системное разрешение нельзя менять при нескольких активных сессиях")
             return self._display_state(sess, user), reasons
-        raw_width = self._stream_number(data.get("client_width"), 0)
-        raw_height = self._stream_number(data.get("client_height"), 0)
+        raw_width, raw_height = self._client_display_size(data, requested)
         if raw_width <= 0 or raw_height <= 0:
-            reasons.append("Клиент не сообщил размер своего экрана")
+            reasons.append("Клиент не сообщил размер экрана или окна")
             return self._display_state(sess, user), reasons
         width = int(max(800, min(8192, raw_width)))
         height = int(max(600, min(8192, raw_height)))
@@ -1034,9 +1062,13 @@ class HostServer:
         except Exception:
             candidate = None
         selected = sess.desktop_size or {}
-        if (display_owner == sess.sid and sess.desktop_mode == "client" and candidate
+        target = {"width": width, "height": height,
+                  "source": "window" if requested == "viewport" else "screen"}
+        if (display_owner == sess.sid and candidate
                 and selected.get("width") == candidate.get("width")
                 and selected.get("height") == candidate.get("height")):
+            sess.desktop_mode = requested
+            sess.desktop_target = target
             return self._display_state(sess, user), reasons
         try:
             ok, chosen, error = await asyncio.get_running_loop().run_in_executor(
@@ -1047,8 +1079,9 @@ class HostServer:
             reasons.append(error or "Windows не применила выбранное разрешение")
             return self._display_state(sess, user), reasons
         self._display_owner = sess.sid
-        sess.desktop_mode = "client"
+        sess.desktop_mode = requested
         sess.desktop_size = chosen
+        sess.desktop_target = target
         self.capture.restart()
         sess.force_full = True
         if chosen["width"] != width or chosen["height"] != height:
@@ -1056,6 +1089,19 @@ class HostServer:
                 f"Применён ближайший поддерживаемый режим {chosen['width']}×{chosen['height']} "
                 f"вместо {width}×{height}")
         return self._display_state(sess, user), reasons
+
+    def _client_display_size(self, data, requested):
+        """Размер физического экрана или текущего viewport с legacy-fallback."""
+        key = "viewport" if requested == "viewport" else "screen"
+        client_display = data.get("client_display")
+        candidate = client_display.get(key) if isinstance(client_display, dict) else None
+        if isinstance(candidate, dict):
+            width = self._stream_number(candidate.get("width"), 0)
+            height = self._stream_number(candidate.get("height"), 0)
+            if width > 0 and height > 0:
+                return width, height
+        return (self._stream_number(data.get("client_width"), 0),
+                self._stream_number(data.get("client_height"), 0))
 
     async def _release_display(self, sess):
         if getattr(self, "_display_owner", None) != sess.sid:

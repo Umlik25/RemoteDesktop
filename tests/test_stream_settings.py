@@ -5,7 +5,7 @@ from unittest import mock
 
 from PIL import Image
 
-from core.host_server import HostServer, Session, encode_jpeg
+from core.host_server import HostServer, InputInjector, Session, encode_jpeg
 from core.display import DisplayManager, best_mode
 
 
@@ -114,6 +114,30 @@ class StreamSettingsTests(unittest.TestCase):
         self.assertGreater(session.ack_latency_ms, 0)
         self.assertEqual([], list(session.sent_times))
 
+    def test_client_display_size_distinguishes_screen_and_window(self):
+        server, _ = self.make_server({"role": "owner", "max_fps": 60})
+        data = {
+            "client_width": 100,
+            "client_height": 100,
+            "client_display": {
+                "screen": {"width": 3456, "height": 2234},
+                "viewport": {"width": 3024, "height": 1712},
+            },
+        }
+
+        self.assertEqual((3456, 2234), server._client_display_size(data, "client"))
+        self.assertEqual((3024, 1712), server._client_display_size(data, "viewport"))
+
+    def test_game_mouse_delta_moves_exact_distance_in_fallback(self):
+        injector = InputInjector.__new__(InputInjector)
+        injector.mouse = SimpleNamespace(position=(100, 200))
+        injector.screen_wh = (1920, 1080)
+
+        with mock.patch("core.host_server._SENDINPUT_OK", False):
+            injector._mouse_move_relative(37, -19)
+
+        self.assertEqual((137, 181), injector.mouse.position)
+
 
 class DisplayConfigTests(unittest.IsolatedAsyncioTestCase):
     async def test_allowed_session_changes_and_restores_shared_display(self):
@@ -135,7 +159,8 @@ class DisplayConfigTests(unittest.IsolatedAsyncioTestCase):
         server._display_owner = None
 
         state, reasons = await server._apply_display_config(session, {
-            "desktop_mode": "client", "client_width": 3456, "client_height": 2234,
+            "desktop_mode": "client",
+            "client_display": {"screen": {"width": 3456, "height": 2234}},
         }, user)
 
         self.assertEqual("client", state["mode"])

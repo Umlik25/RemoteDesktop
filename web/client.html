@@ -77,7 +77,8 @@
   </div>
   <label class="f">Рабочий стол Windows<select id="cDesktop">
     <option value="host" selected>Оставить разрешение хоста</option>
-    <option value="client">Под разрешение этого ноутбука</option>
+    <option value="client">Под экран ноутбука</option>
+    <option value="viewport">Под текущее окно</option>
   </select></label>
   <p class="muted">Фактические FPS и качество зависят от сети, кодирования на хосте и возможностей этого устройства. 90–144 FPS требуют быстрой LAN.</p>
   <div class="row">
@@ -93,6 +94,27 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 })[ch]);
 let hosts = [], current = null, mode = 'login';
+
+function pixelSize(width, height, dpr) {
+  return {width:Math.max(1, Math.round((Number(width) || 1) * dpr)),
+          height:Math.max(1, Math.round((Number(height) || 1) * dpr))};
+}
+function clientDisplayInfo() {
+  const dpr = Number(window.devicePixelRatio) > 0 ? Number(window.devicePixelRatio) : 1;
+  const viewport = window.visualViewport;
+  return {
+    screen: pixelSize(window.screen.width, window.screen.height, dpr),
+    viewport: pixelSize((viewport && viewport.width) || window.innerWidth,
+                        (viewport && viewport.height) || window.innerHeight, dpr),
+  };
+}
+function updateClientDisplayOptions() {
+  const info = clientDisplayInfo();
+  $('#cDesktop option[value="client"]').textContent =
+    `Экран ноутбука ${info.screen.width}×${info.screen.height}`;
+  $('#cDesktop option[value="viewport"]').textContent =
+    `Текущее окно ${info.viewport.width}×${info.viewport.height}`;
+}
 
 function swMode(m) {
   mode = m;
@@ -164,6 +186,7 @@ async function addManual() {
 
 async function openConnect(ip, port, name) {
   current = {ip, port, name};
+  updateClientDisplayOptions();
   $('#dcTitle').textContent = 'Подключение к «' + name + '»';
   $('#cErr').textContent = '';
   // Пробуем получить свежие сведения напрямую с хоста
@@ -213,6 +236,8 @@ async function doConnect() {
 
 loadHosts();
 setInterval(loadHosts, 4000);
+window.addEventListener('resize', updateClientDisplayOptions);
+if (window.visualViewport) window.visualViewport.addEventListener('resize', updateClientDisplayOptions);
 </script>
 </body>
 </html>
