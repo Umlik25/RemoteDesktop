@@ -11,6 +11,8 @@
   <span class="muted">Панель хоста / владельца</span>
   <span id="hostname" class="badge b-acc"></span>
   <span style="flex:1"></span>
+  <span id="adminBadge" class="badge b-acc" style="display:none"></span>
+  <button id="btnLogout" class="sec small" style="display:none" onclick="logout()">Выйти</button>
   <span id="statusBadge" class="badge b-ok">—</span>
 </div>
 
@@ -19,9 +21,18 @@
     <h2>Создайте учётную запись владельца</h2>
     <p class="muted">Владелец — привилегированная сессия: резерв ресурсов, управление пользователями и подключениями.</p>
     <label class="f">Имя пользователя<input id="ownUser"></label>
-    <label class="f">Пароль<input id="ownPass" type="password"></label>
+    <label class="f">Пароль (минимум 8 символов)<input id="ownPass" type="password" minlength="8" autocomplete="new-password"></label>
     <button onclick="setupOwner()">Создать владельца</button>
     <p id="ownerErr" class="muted" style="color:var(--err)"></p>
+  </div>
+
+  <div id="adminLogin" class="card" style="display:none;max-width:420px;margin:40px auto">
+    <h2>Вход в панель хоста</h2>
+    <p class="muted">Управление доступно владельцу и администраторам.</p>
+    <label class="f">Имя пользователя<input id="loginUser" autocomplete="username"></label>
+    <label class="f">Пароль<input id="loginPass" type="password" autocomplete="current-password"></label>
+    <button onclick="loginAdmin()">Войти</button>
+    <p id="loginErr" class="muted" style="color:var(--err)"></p>
   </div>
 
   <div id="main" style="display:none">
@@ -91,7 +102,7 @@
         </div>
         <table id="usersTable">
           <thead><tr><th>Имя</th><th>Роль</th><th>Профиль</th><th>Приоритет</th><th>Ввод</th><th>Буфер</th>
-          <th>Файлы</th><th>Макс. FPS</th><th>Статус</th><th></th></tr></thead>
+          <th>Файлы</th><th>Квота</th><th>Макс. FPS</th><th>Статус</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -110,10 +121,13 @@
           <select id="invTtl"><option value="1">Код действует 1 ч</option><option value="24" selected>24 ч</option><option value="168">7 дней</option></select>
           <select id="invSess"><option value="">Доступ бессрочно</option><option value="4">Доступ 4 ч</option><option value="24">24 ч</option><option value="168">7 дней</option></select>
           <label class="f" style="margin:0"><input type="checkbox" id="invInput" checked style="width:auto"> Ввод</label>
+          <label class="f" style="margin:0"><input type="checkbox" id="invClip" style="width:auto"> Буфер</label>
+          <label class="f" style="margin:0"><input type="checkbox" id="invFiles" style="width:auto"> Файлы</label>
+          <select id="invQuota"><option value="512">Файлы: 512 МБ</option><option value="2048">2 ГБ</option><option value="10240">10 ГБ</option></select>
           <button onclick="createInvite()">Создать одноразовый код</button>
         </div>
         <p class="muted">Приглашённый вводит код и придумывает себе логин/пароль на экране подключения клиента. Код одноразовый и отзывается мгновенно.</p>
-        <table id="invTable"><thead><tr><th>Код</th><th>Роль</th><th>Профиль</th><th>Ввод</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table>
+        <table id="invTable"><thead><tr><th>Код</th><th>Роль</th><th>Профиль</th><th>Ввод</th><th>Файлы</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table>
       </div>
     </div>
 
@@ -148,7 +162,7 @@
 <dialog id="dlgUser">
   <h2>Новый пользователь</h2>
   <label class="f">Имя<input id="nuName"></label>
-  <label class="f">Пароль<input id="nuPass" type="password"></label>
+  <label class="f">Пароль (минимум 8 символов)<input id="nuPass" type="password" minlength="8"></label>
   <label class="f">Роль<select id="nuRole">
     <option value="user">Пользователь</option><option value="guest">Гость</option><option value="admin">Администратор</option>
   </select></label>
@@ -161,9 +175,10 @@
     <option value="high">Высокий</option><option value="critical">Критический</option>
   </select></label>
   <label class="f">Макс. FPS<select id="nuFps"><option>30</option><option selected>60</option><option>90</option><option>120</option><option>144</option></select></label>
+  <label class="f">Квота личных файлов, МБ<input id="nuQuota" type="number" min="16" max="102400" value="2048"></label>
   <label class="f"><input type="checkbox" id="nuInput" checked style="width:auto"> Разрешить клавиатуру/мышь</label>
   <label class="f"><input type="checkbox" id="nuClip" style="width:auto"> Разрешить буфер обмена</label>
-  <label class="f"><input type="checkbox" id="nuFiles" style="width:auto"> Разрешить передачу файлов (этап 2)</label>
+  <label class="f"><input type="checkbox" id="nuFiles" style="width:auto"> Разрешить передачу файлов</label>
   <div class="row"><button onclick="createUser()">Создать</button>
   <button class="sec" onclick="dlgUser.close()">Отмена</button></div>
   <p id="nuErr" class="muted" style="color:var(--err)"></p>
@@ -171,7 +186,20 @@
 
 <script>
 const $ = s => document.querySelector(s);
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+})[ch]);
+function actionButton(text, className, handler, title='') {
+  const button = document.createElement('button');
+  button.textContent = text;
+  button.className = className;
+  button.title = title;
+  button.addEventListener('click', handler);
+  return button;
+}
 let cfg = {};
+let adminToken = sessionStorage.getItem('app_remote_admin_token') || '';
+let panelWs = null;
 
 document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('.tabs button').forEach(x => x.classList.remove('active'));
@@ -186,7 +214,11 @@ document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
 });
 
 async function api(path, body) {
-  const r = await fetch(path, body ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {});
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (adminToken) headers.Authorization = 'Bearer ' + adminToken;
+  const r = await fetch(path, {method: body ? 'POST' : 'GET', headers,
+    body: body ? JSON.stringify(body) : undefined});
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -195,14 +227,57 @@ async function init() {
   const info = await api('/api/info');
   $('#hostname').textContent = info.name;
   if (info.needs_owner_setup) { $('#ownerSetup').style.display = ''; return; }
+  if (adminToken) {
+    try {
+      const me = await api('/api/admin/me');
+      showMain(me);
+      return;
+    } catch (_) {
+      sessionStorage.removeItem('app_remote_admin_token');
+      adminToken = '';
+    }
+  }
+  $('#adminLogin').style.display = '';
+}
+
+function showMain(me) {
+  $('#ownerSetup').style.display = 'none';
+  $('#adminLogin').style.display = 'none';
   $('#main').style.display = '';
+  $('#adminBadge').textContent = `${me.username} · ${me.role === 'owner' ? 'владелец' : 'администратор'}`;
+  $('#adminBadge').style.display = '';
+  $('#btnLogout').style.display = '';
   connectWs();
+}
+
+async function loginAdmin(username=$('#loginUser').value.trim(), password=$('#loginPass').value) {
+  $('#loginErr').textContent = '';
+  try {
+    const d = await api('/api/login', {username, password});
+    if (!['owner', 'admin'].includes(d.role)) throw new Error('У этой учётной записи нет доступа к панели хоста');
+    adminToken = d.token;
+    sessionStorage.setItem('app_remote_admin_token', adminToken);
+    $('#loginPass').value = '';
+    showMain({username: d.username, role: d.role});
+  } catch (e) {
+    adminToken = '';
+    sessionStorage.removeItem('app_remote_admin_token');
+    $('#loginErr').textContent = e.message;
+  }
+}
+
+function logout() {
+  adminToken = '';
+  sessionStorage.removeItem('app_remote_admin_token');
+  if (panelWs) panelWs.close();
+  location.reload();
 }
 
 async function setupOwner() {
   try {
-    await api('/api/setup_owner', {username: $('#ownUser').value.trim(), password: $('#ownPass').value});
-    location.reload();
+    const username = $('#ownUser').value.trim(), password = $('#ownPass').value;
+    await api('/api/setup_owner', {username, password});
+    await loginAdmin(username, password);
   } catch(e) { $('#ownerErr').textContent = e.message; }
 }
 
@@ -213,7 +288,9 @@ function bar(id, v, warnAt=75) {
 }
 
 function connectWs() {
-  const ws = new WebSocket(`ws://${location.host}/ws/panel`);
+  if (!adminToken) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = panelWs = new WebSocket(`${proto}://${location.host}/ws/panel?token=${encodeURIComponent(adminToken)}`);
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
     if (d.type !== 'tick') return;
@@ -238,7 +315,11 @@ function connectWs() {
     $('#btnGame').textContent = (cfg.owner_gaming_mode ? '✓ ' : '') + 'Игровая сессия владельца';
     renderSessions(d.sessions);
   };
-  ws.onclose = () => setTimeout(connectWs, 3000);
+  ws.onclose = e => {
+    if (panelWs === ws) panelWs = null;
+    if (e.code === 4003) { logout(); return; }
+    if (adminToken) setTimeout(connectWs, 3000);
+  };
 }
 
 function renderSessions(list) {
@@ -246,13 +327,13 @@ function renderSessions(list) {
   $('#noSess').style.display = list.length ? 'none' : '';
   for (const s of list) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${s.username}</td><td>${s.ip}</td>
-      <td><span class="badge ${s.route==='LAN Direct'?'b-ok':'b-acc'}">${s.route}</span></td>
-      <td>${s.profile}</td><td>${s.priority}</td><td>${s.fps_target}</td>
-      <td>${s.bitrate_mbps} Мбит/с</td>
-      <td>${s.degrade ? '<span class="badge b-warn">ступень ' + s.degrade + '</span>' : '—'}</td>
-      <td>${s.connected_at}</td>
-      <td><button class="danger small" onclick="kick('${s.sid}')">Завершить</button></td>`;
+    tr.innerHTML = `<td>${esc(s.username)}</td><td>${esc(s.ip)}</td>
+      <td><span class="badge ${s.route==='LAN Direct'?'b-ok':'b-acc'}">${esc(s.route)}</span></td>
+      <td>${esc(s.profile)}</td><td>${esc(s.priority)}</td><td>${esc(s.fps_target)}</td>
+      <td>${esc(s.bitrate_mbps)} Мбит/с</td>
+      <td>${s.degrade ? '<span class="badge b-warn">ступень ' + esc(s.degrade) + '</span>' : '—'}</td>
+      <td>${esc(s.connected_at)}</td><td class="row"></td>`;
+    tr.lastElementChild.appendChild(actionButton('Завершить', 'danger small', () => kick(s.sid)));
     tb.appendChild(tr);
   }
 }
@@ -265,17 +346,25 @@ async function loadUsers() {
   const tb = $('#usersTable tbody'); tb.innerHTML = '';
   for (const u of users) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${u.username}</td><td>${u.role}</td><td>${u.profile}</td><td>${u.priority}</td>
+    tr.innerHTML = `<td>${esc(u.username)}</td><td>${esc(u.role)}</td><td>${esc(u.profile)}</td><td>${esc(u.priority)}</td>
       <td>${u.allow_input?'✓':'—'}</td><td>${u.allow_clipboard?'✓':'—'}</td><td>${u.allow_files?'✓':'—'}</td>
-      <td>${u.max_fps}</td>
+      <td>${esc(u.disk_quota_mb)} МБ</td><td>${esc(u.max_fps)}</td>
       <td>${u.blocked?'<span class="badge b-err">заблокирован</span>':'<span class="badge b-ok">активен</span>'}</td>
-      <td class="row">
-        <button class="sec small" onclick="setUserInput('${u.username}', ${!u.allow_input})">${u.allow_input?'Запретить ввод':'Разрешить ввод'}</button>
-        <button class="sec small" onclick="resetPw('${u.username}')">Сбросить пароль</button>
-        <button class="sec small" onclick="resetCode('${u.username}')" title="Одноразовый код: пользователь сам задаст новый пароль на экране подключения клиента">Код сброса</button>
-        <button class="sec small" onclick="blockUser('${u.username}', ${!u.blocked})">${u.blocked?'Разблокировать':'Блокировать'}</button>
-        ${u.role!=='owner' ? `<button class="danger small" onclick="delUser('${u.username}')">Удалить</button>` : ''}
-      </td>`;
+      <td class="row"></td>`;
+    const actions = tr.lastElementChild;
+    actions.appendChild(actionButton(u.allow_input ? 'Запретить ввод' : 'Разрешить ввод',
+      'sec small', () => setUserInput(u.username, !u.allow_input)));
+    actions.appendChild(actionButton(u.allow_clipboard ? 'Запретить буфер' : 'Разрешить буфер',
+      'sec small', () => setUserField(u.username, {allow_clipboard: !u.allow_clipboard})));
+    actions.appendChild(actionButton(u.allow_files ? 'Запретить файлы' : 'Разрешить файлы',
+      'sec small', () => setUserField(u.username, {allow_files: !u.allow_files})));
+    actions.appendChild(actionButton('Квота', 'sec small', () => setUserQuota(u.username, u.disk_quota_mb)));
+    actions.appendChild(actionButton('Сбросить пароль', 'sec small', () => resetPw(u.username)));
+    actions.appendChild(actionButton('Код сброса', 'sec small', () => resetCode(u.username),
+      'Одноразовый код: пользователь сам задаст новый пароль на экране подключения клиента'));
+    actions.appendChild(actionButton(u.blocked ? 'Разблокировать' : 'Блокировать',
+      'sec small', () => blockUser(u.username, !u.blocked)));
+    if (u.role !== 'owner') actions.appendChild(actionButton('Удалить', 'danger small', () => delUser(u.username)));
     tb.appendChild(tr);
   }
 }
@@ -285,13 +374,14 @@ async function createUser() {
     await api('/api/users/create', {
       username: $('#nuName').value.trim(), password: $('#nuPass').value,
       role: $('#nuRole').value, profile: $('#nuProfile').value, priority: $('#nuPrio').value,
-      max_fps: +$('#nuFps').value, allow_input: $('#nuInput').checked,
+      max_fps: +$('#nuFps').value, disk_quota_mb: +$('#nuQuota').value,
+      allow_input: $('#nuInput').checked,
       allow_clipboard: $('#nuClip').checked, allow_files: $('#nuFiles').checked});
     dlgUser.close(); loadUsers();
   } catch(e) { $('#nuErr').textContent = e.message; }
 }
 async function resetPw(username) {
-  const pw = prompt('Новый пароль для «' + username + '» (мин. 4 символа):');
+  const pw = prompt('Новый пароль для «' + username + '» (мин. 8 символов):');
   if (pw === null) return;
   try { await api('/api/users/password', {username, password: pw});
     alert('Пароль изменён. Прежние токены входа отозваны, активные сессии не тронуты.'); }
@@ -305,8 +395,17 @@ async function resetCode(username) {
   } catch(e) { alert('Ошибка: ' + e.message); }
 }
 async function setUserInput(username, allow) {
-  await api('/api/users/update', {username, fields:{allow_input: allow}});
+  await setUserField(username, {allow_input: allow});
+}
+async function setUserField(username, fields) {
+  await api('/api/users/update', {username, fields});
   loadUsers();
+}
+async function setUserQuota(username, current) {
+  const value = prompt('Квота личных файлов в МБ (16–102400):', current);
+  if (value === null) return;
+  try { await setUserField(username, {disk_quota_mb: +value}); }
+  catch(e) { alert('Ошибка: ' + e.message); }
 }
 async function blockUser(username, blocked) { await api('/api/users/update', {username, fields:{blocked}}); loadUsers(); }
 async function delUser(username) { if (confirm('Удалить пользователя и отозвать доступ?')) { await api('/api/users/delete', {username}); loadUsers(); } }
@@ -318,10 +417,10 @@ async function loadInvites() {
     const st = i.used ? '<span class="badge b-acc">использован</span>' :
                i.expired ? '<span class="badge b-err">истёк</span>' : '<span class="badge b-ok">активен</span>';
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td><code>${i.code}</code></td><td>${i.role}</td><td>${i.profile}</td>
-      <td>${i.allow_input !== false ? '✓' : '—'}</td>
-      <td>${i.created}</td><td>${st}</td>
-      <td><button class="danger small" onclick="revokeInvite('${i.code}')">Отозвать</button></td>`;
+    tr.innerHTML = `<td><code>${esc(i.code)}</code></td><td>${esc(i.role)}</td><td>${esc(i.profile)}</td>
+      <td>${i.allow_input !== false ? '✓' : '—'}</td><td>${i.allow_files ? esc(i.disk_quota_mb) + ' МБ' : '—'}</td>
+      <td>${esc(i.created)}</td><td>${st}</td><td></td>`;
+    tr.lastElementChild.appendChild(actionButton('Отозвать', 'danger small', () => revokeInvite(i.code)));
     tb.appendChild(tr);
   }
 }
@@ -330,6 +429,9 @@ async function createInvite() {
     role: $('#invRole').value, profile: $('#invProfile').value,
     ttl_hours: +$('#invTtl').value,
     allow_input: $('#invInput').checked,
+    allow_clipboard: $('#invClip').checked,
+    allow_files: $('#invFiles').checked,
+    disk_quota_mb: +$('#invQuota').value,
     session_hours: $('#invSess').value ? +$('#invSess').value : null});
   alert('Одноразовый код приглашения:\n\n' + d.code + '\n\nПередайте его пользователю.');
   loadInvites();
@@ -347,46 +449,46 @@ async function loadReport() {
     const L = lv[k];
     lvHtml += `<div class="card" style="margin-bottom:10px">
       <div class="row" style="justify-content:space-between">
-        <b>${name}</b>
+        <b>${esc(name)}</b>
         <span class="badge ${L.available?'b-ok':'b-err'}">${L.available?'ДОСТУПЕН':'НЕДОСТУПЕН'}</span>
       </div>
-      <div class="muted">Почему: ${L.reasons.join('; ')}</div>
-      <div class="muted">Ограничения: ${L.limitations.join('; ')}</div>
-      <div class="muted">Режим GPU: ${L.gpu_mode} · Достоверность: ${CONF_RU[L.confidence]||L.confidence}</div>
+      <div class="muted">Почему: ${esc(L.reasons.join('; '))}</div>
+      <div class="muted">Ограничения: ${esc(L.limitations.join('; '))}</div>
+      <div class="muted">Режим GPU: ${esc(L.gpu_mode)} · Достоверность: ${esc(CONF_RU[L.confidence]||L.confidence)}</div>
     </div>`;
   }
   let capHtml = '<table><thead><tr><th>Профиль</th><th>Рекоменд. сессий</th><th>Доступно сейчас</th><th>Узкое место</th><th>Ожид. качество</th><th>Достоверность</th></tr></thead><tbody>';
   for (const [k, c] of Object.entries(d.capacity)) {
-    capHtml += `<tr><td>${c.title}</td><td>${c.recommended}</td><td>${c.current_available}</td>
-      <td><span class="badge b-warn">${c.bottleneck}</span></td><td>${c.expected_quality}</td><td>${CONF_RU[c.confidence]||c.confidence}</td></tr>`;
+    capHtml += `<tr><td>${esc(c.title)}</td><td>${esc(c.recommended)}</td><td>${esc(c.current_available)}</td>
+      <td><span class="badge b-warn">${esc(c.bottleneck)}</span></td><td>${esc(c.expected_quality)}</td><td>${esc(CONF_RU[c.confidence]||c.confidence)}</td></tr>`;
   }
   capHtml += '</tbody></table>';
   const enc = s.encoders, v = s.virtualization;
   $('#reportBox').innerHTML = `
-    <div class="notice">${d.report.warning}</div>
+    <div class="notice">${esc(d.report.warning)}</div>
     <div class="grid g2">
       <div class="card"><h2>Оборудование</h2><div class="kv">
-        <b>CPU</b><span>${s.cpu}</span>
-        <b>Ядра / потоки</b><span>${s.cores} / ${s.threads}</span>
-        <b>RAM</b><span>${s.ram_gb} ГБ</span>
-        <b>GPU</b><span>${s.gpus.map(g=>g.name + (g.vram_gb?` (${g.vram_gb} ГБ VRAM)`:'')).join('<br>')}</span>
-        <b>Диски</b><span>${s.disks.map(x=>`${x.mount} ${x.free_gb}/${x.total_gb} ГБ свободно`).join('<br>')}</span>
-        <b>LAN</b><span>${s.nics.map(n=>`${n.name}: ${n.speed_mbps} Мбит/с`).join('<br>')||'н/д'}</span>
-        <b>ОС</b><span>${s.os}</span>
-        <b>Бенчмарк CPU</b><span>однопоточный ${d.bench.single_score}, многопоточный ~${d.bench.multi_score_est} (${d.bench.note})</span>
+        <b>CPU</b><span>${esc(s.cpu)}</span>
+        <b>Ядра / потоки</b><span>${esc(s.cores)} / ${esc(s.threads)}</span>
+        <b>RAM</b><span>${esc(s.ram_gb)} ГБ</span>
+        <b>GPU</b><span>${s.gpus.map(g=>esc(g.name) + (g.vram_gb?` (${esc(g.vram_gb)} ГБ VRAM)`:'')).join('<br>')}</span>
+        <b>Диски</b><span>${s.disks.map(x=>`${esc(x.mount)} ${esc(x.free_gb)}/${esc(x.total_gb)} ГБ свободно`).join('<br>')}</span>
+        <b>LAN</b><span>${s.nics.map(n=>`${esc(n.name)}: ${esc(n.speed_mbps)} Мбит/с`).join('<br>')||'н/д'}</span>
+        <b>ОС</b><span>${esc(s.os)}</span>
+        <b>Бенчмарк CPU</b><span>однопоточный ${esc(d.bench.single_score)}, многопоточный ~${esc(d.bench.multi_score_est)} (${esc(d.bench.note)})</span>
       </div></div>
       <div class="card"><h2>Кодирование и виртуализация</h2><div class="kv">
         <b>H.264</b><span>${enc.h264?'да':'нет'}</span>
         <b>HEVC</b><span>${enc.hevc?'да':'нет'}</span>
         <b>AV1</b><span>${enc.av1?'да':'нет'}</span>
-        <b>API</b><span>${enc.apis.join(', ')||'нет'}</span>
-        <b>Аппаратных энкодеров</b><span>${enc.hw_encoders}</span>
+        <b>API</b><span>${esc(enc.apis.join(', ')||'нет')}</span>
+        <b>Аппаратных энкодеров</b><span>${esc(enc.hw_encoders)}</span>
         <b>Виртуализация CPU</b><span>${v.cpu_virt===null?'неизвестно':(v.cpu_virt?'включена':'выключена')}</span>
         <b>Hyper-V</b><span>${v.hyperv===null?'н/д':(v.hyperv?'активен':'нет')}</span>
         <b>IOMMU</b><span>${v.iommu===null?'неизвестно (проверьте BIOS)':(v.iommu?'да':'нет')}</span>
-        <b>GPU passthrough</b><span>${v.gpu_passthrough}</span>
+        <b>GPU passthrough</b><span>${esc(v.gpu_passthrough)}</span>
       </div>
-      <p class="muted">${enc.notes.concat(v.notes).join(' · ')}</p></div>
+      <p class="muted">${esc(enc.notes.concat(v.notes).join(' · '))}</p></div>
     </div>
     <div class="card" style="margin-top:14px"><h2>Уровни готовности</h2>${lvHtml}</div>
     <div class="card" style="margin-top:14px"><h2>Capacity Planner (прогноз, не гарантия)</h2>${capHtml}

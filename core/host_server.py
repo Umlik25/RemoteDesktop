@@ -12,13 +12,18 @@ MVP-ограничения (честно):
 import asyncio
 import collections
 import concurrent.futures
+import hashlib
 import io
 import ipaddress
 import json
+import math
+import os
 import socket
 import struct
 import time
 import uuid
+from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 import psutil
 from aiohttp import web, WSMsgType
@@ -141,6 +146,9 @@ except Exception:
     INPUT_OK = False
 
 PRIORITY_ORDER = {"low": 0, "normal": 1, "high": 2, "critical": 3}
+LOGIN_ATTEMPT_LIMIT = 8
+LOGIN_ATTEMPT_WINDOW = 60
+MAX_UPLOAD_MB = 256
 
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -368,21 +376,24 @@ KEY_MAP = {}
 BTN_MAP = {}
 _VK_PUNCT = {}
 if INPUT_OK:
-    KEY_MAP = {
-        "Enter": Key.enter, "Backspace": Key.backspace, "Tab": Key.tab,
-        "Escape": Key.esc, "Delete": Key.delete, "Insert": Key.insert,
-        "Home": Key.home, "End": Key.end, "PageUp": Key.page_up, "PageDown": Key.page_down,
-        "ArrowUp": Key.up, "ArrowDown": Key.down, "ArrowLeft": Key.left, "ArrowRight": Key.right,
-        "Shift": Key.shift, "Control": Key.ctrl, "Alt": Key.alt, "Meta": Key.cmd,
-        "CapsLock": Key.caps_lock, " ": Key.space,
-        **{f"F{i}": getattr(Key, f"f{i}") for i in range(1, 13)},
-    }
-    for _name, _attr in (("ContextMenu", "menu"), ("AltGraph", "alt_gr"),
+    for _name, _attr in (
+            ("Enter", "enter"), ("Backspace", "backspace"), ("Tab", "tab"),
+            ("Escape", "esc"), ("Delete", "delete"), ("Insert", "insert"),
+            ("Home", "home"), ("End", "end"), ("PageUp", "page_up"),
+            ("PageDown", "page_down"), ("ArrowUp", "up"), ("ArrowDown", "down"),
+            ("ArrowLeft", "left"), ("ArrowRight", "right"), ("Shift", "shift"),
+            ("Control", "ctrl"), ("Alt", "alt"), ("Meta", "cmd"),
+            ("CapsLock", "caps_lock"), (" ", "space"),
+            ("ContextMenu", "menu"), ("AltGraph", "alt_gr"),
                          ("NumLock", "num_lock"), ("ScrollLock", "scroll_lock"),
                          ("Pause", "pause"), ("PrintScreen", "print_screen")):
         _k = getattr(Key, _attr, None)
         if _k is not None:
             KEY_MAP[_name] = _k
+    for _i in range(1, 13):
+        _k = getattr(Key, f"f{_i}", None)
+        if _k is not None:
+            KEY_MAP[f"F{_i}"] = _k
     BTN_MAP = {0: Button.left, 1: Button.middle, 2: Button.right}
     for _b, _attr in ((3, "x1"), (4, "x2")):   # боковые кнопки (назад/вперёд)
         _btn = getattr(Button, _attr, None)
@@ -515,6 +526,7 @@ class Session:
         self.fps = min(base["fps"], user.get("max_fps", 60))
         self.quality = base["quality"]
         self.scale = base["scale"]
+        self.adaptive = True       # сеть может временно снижать параметры потока
         self.degrade = 0           # 0..4 — ступень деградации по нагрузке хоста
         self.net_degrade = 0       # 0..3 — деградация из-за пропускной способности сети
         self.force_full = True     # следующий кадр — полный (первый / по запросу клиента)
@@ -530,7 +542,7 @@ class Session:
         """Параметры с учётом деградации (нагрузка хоста + сеть):
         битрейт → FPS → разрешение."""
         q, f, s = self.quality, self.fps, self.scale
-        lvl = min(4, self.degrade + self.net_degrade)
+        lvl = min(4, self.degrade + (self.net_degrade if self.adaptive else 0))
         if lvl >= 1:
             q = max(30, q - 20)
         if lvl >= 2:
@@ -539,14 +551,16 @@ class Session:
             s = min(s, 0.5)
         return f, q, s
 
-    def info(self):
-        f, q, s = self.effective()
+    def info(self, effective=None):
+        f, q, s = effective or self.effective()
         return {
             "sid": self.sid, "username": self.username, "ip": self.ip,
             "route": self.route, "profile": self.profile,
             "priority": self.priority,
             "connected_at": time.strftime("%H:%M:%S", time.localtime(self.connected_at)),
             "fps_target": f, "quality": q, "scale": s,
+            "requested": {"fps": self.fps, "quality": self.quality,
+                          "scale": self.scale, "adaptive": self.adaptive},
             "degrade": self.degrade, "net_degrade": self.net_degrade,
             "bitrate_mbps": round(self.bitrate_mbps, 1),
             "frames": self.frames,
@@ -566,6 +580,7 @@ class HostServer:
         self._load_task = None
         self._loop = None
         self._frame_evt = None     # событие «есть новый кадр» для отправителей
+        self._login_attempts = collections.defaultdict(collections.deque)
         self.app = self._build_app()
 
     # ------------------------------------------------------------ HTTP app
@@ -573,24 +588,33 @@ class HostServer:
     def _build_app(self):
         @web.middleware
         async def cors(request, handler):
-            if request.method == "OPTIONS":
-                resp = web.Response()
-            else:
-                try:
+            origin = request.headers.get("Origin")
+            if origin and not self._origin_allowed(request, origin):
+                raise web.HTTPForbidden(text="Недоверенный источник запроса")
+            try:
+                if request.method == "OPTIONS":
+                    resp = web.Response()
+                else:
                     resp = await handler(request)
-                except web.HTTPException as e:
-                    resp = e
-            resp.headers["Access-Control-Allow-Origin"] = "*"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            except web.HTTPException as error:
+                if origin:
+                    error.headers["Access-Control-Allow-Origin"] = origin
+                    error.headers["Vary"] = "Origin"
+                raise
+            if origin:
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Vary"] = "Origin"
+                resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+                resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             return resp
 
-        app = web.Application(middlewares=[cors])
+        app = web.Application(middlewares=[cors], client_max_size=(MAX_UPLOAD_MB + 2) * 2**20)
         r = app.router
         r.add_get("/", self.page_panel)
         r.add_static("/static/", state.WEB_DIR)
         r.add_get("/api/info", self.api_info)
         r.add_post("/api/login", self.api_login)
+        r.add_get("/api/admin/me", self.api_admin_me)
         r.add_post("/api/redeem", self.api_redeem)
         r.add_post("/api/setup_owner", self.api_setup_owner)
         r.add_get("/api/report", self.api_report)
@@ -601,6 +625,10 @@ class HostServer:
         r.add_post("/api/users/password", self.api_user_password)
         r.add_post("/api/reset/create", self.api_reset_create)
         r.add_post("/api/reset/redeem", self.api_reset_redeem)
+        r.add_get("/api/files", self.api_files)
+        r.add_post("/api/files/upload", self.api_file_upload)
+        r.add_get("/api/files/download/{name}", self.api_file_download)
+        r.add_post("/api/files/delete", self.api_file_delete)
         r.add_post("/api/users/delete", self.api_user_delete)
         r.add_get("/api/invites", self.api_invites)
         r.add_post("/api/invites/create", self.api_invite_create)
@@ -640,16 +668,110 @@ class HostServer:
         peer = request.remote or ""
         return peer in ("127.0.0.1", "::1")
 
+    def _origin_allowed(self, request, origin):
+        """Разрешает same-origin панель и локальный клиент App_Remote."""
+        try:
+            if origin.rstrip("/") == f"{request.scheme}://{request.host}".rstrip("/"):
+                return True
+            parsed = urlsplit(origin)
+            return (parsed.scheme in ("http", "https")
+                    and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+                    and parsed.port == int(self.config.get("client_port", 8600)))
+        except (TypeError, ValueError):
+            return False
+
+    def _token(self, request):
+        return (request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+                or request.query.get("token", ""))
+
+    def _admin_identity(self, request):
+        """Возвращает (имя, запись) только для owner/admin с валидным токеном."""
+        token = self._token(request)
+        username, user = auth.check_token(token)
+        if user and user.get("role") in ("owner", "admin"):
+            return username, user
+        return None, None
+
     def _admin(self, request):
-        """Локальная консоль владельца или токен owner/admin."""
-        if self._is_local(request):
-            return "owner(local)"
-        token = (request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-                 or request.query.get("token", ""))
-        username, u = auth.check_token(token)
-        if u and u.get("role") in ("owner", "admin"):
-            return username
-        return None
+        """Административная панель всегда требует токен, включая localhost."""
+        username, _ = self._admin_identity(request)
+        return username
+
+    def _login_retry_after(self, remote):
+        now = time.monotonic()
+        attempts = self._login_attempts[remote]
+        while attempts and now - attempts[0] >= LOGIN_ATTEMPT_WINDOW:
+            attempts.popleft()
+        if len(attempts) < LOGIN_ATTEMPT_LIMIT:
+            return 0
+        return max(1, int(LOGIN_ATTEMPT_WINDOW - (now - attempts[0])))
+
+    def _login_failed(self, remote):
+        self._login_attempts[remote].append(time.monotonic())
+
+    def _login_succeeded(self, remote):
+        self._login_attempts.pop(remote, None)
+
+    def _can_manage_user(self, request, target_name, *, new_role=None, destructive=False):
+        actor, actor_user = self._admin_identity(request)
+        if not actor:
+            raise web.HTTPForbidden(text="Требуется вход владельца или администратора")
+        target = auth.get_user(target_name)
+        if not target:
+            raise web.HTTPBadRequest(text="Нет такого пользователя")
+        if actor_user.get("role") != "owner" and target.get("role") in ("owner", "admin"):
+            raise web.HTTPForbidden(text="Администратор не может изменять владельца или другого администратора")
+        if target.get("role") == "owner" and new_role and new_role != "owner":
+            raise web.HTTPForbidden(text="Роль владельца нельзя изменить через панель")
+        if new_role == "owner":
+            raise web.HTTPForbidden(text="Назначение владельца через панель запрещено")
+        if actor_user.get("role") != "owner" and new_role == "admin":
+            raise web.HTTPForbidden(text="Только владелец может назначать администраторов")
+        if destructive and target.get("role") == "owner":
+            raise web.HTTPForbidden(text="Учётную запись владельца нельзя удалить")
+        if destructive and actor == target_name:
+            raise web.HTTPBadRequest(text="Нельзя удалить или заблокировать собственную учётную запись")
+        return actor, actor_user, target
+
+    def _file_identity(self, request):
+        username, user = auth.check_token(self._token(request))
+        if not auth.user_is_active(user):
+            raise web.HTTPUnauthorized(text="Сеанс истёк. Войдите снова.")
+        if not user.get("allow_files", False):
+            raise web.HTTPForbidden(text="Передача файлов не разрешена владельцем хоста")
+        return username, user
+
+    def _user_file_dir(self, username, user=None):
+        storage_id = (user or auth.get_user(username) or {}).get("storage_id", "")
+        if len(storage_id) == 24 and all(ch in "0123456789abcdef" for ch in storage_id):
+            user_key = storage_id
+        else:
+            user_key = hashlib.sha256(username.encode("utf-8")).hexdigest()[:24]
+        root = Path(state.DATA_DIR) / "files" / user_key
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+        return root
+
+    def _safe_filename(self, value):
+        name = str(value or "").strip()
+        forbidden = '<>:"/\\|?*'
+        if (not name or len(name) > 180 or name.startswith(".")
+                or name.endswith((".", " ")) or any(ch in forbidden or ord(ch) < 32 for ch in name)):
+            raise web.HTTPBadRequest(text="Недопустимое имя файла")
+        return name
+
+    def _file_usage(self, root):
+        total = 0
+        for path in root.iterdir():
+            try:
+                if path.is_file() and not path.is_symlink():
+                    total += path.stat().st_size
+            except OSError:
+                continue
+        return total
 
     def _input_permission(self, user):
         if not user or user.get("blocked"):
@@ -758,6 +880,97 @@ class HostServer:
             return 240
         return max(1, int((user or {}).get("max_fps", 60) or 60))
 
+    def _stream_limits(self, user):
+        return {
+            "min_fps": 1, "max_fps": self._fps_cap(user),
+            "min_quality": 20, "max_quality": 95,
+            "min_scale": 0.25, "max_scale": 1.0,
+        }
+
+    @staticmethod
+    def _stream_number(value, fallback):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return number if math.isfinite(number) else fallback
+
+    def _stream_state(self, sess, user=None, reasons=None):
+        """Выбранные и фактически применённые параметры для ответа клиенту."""
+        user = user or sess.user
+        fps, quality, scale = self._stream_params(sess)
+        why = list(reasons or [])
+        if self.config.get("work_only_mode") and user.get("role") not in ("owner", "admin"):
+            if sess.fps > 30 or sess.quality > 60:
+                why.append("Режим «только работа» ограничивает поток до 30 FPS и Q60")
+        if sess.degrade > 0:
+            why.append(f"Нагрузка хоста временно снизила поток (ступень {sess.degrade})")
+        if sess.adaptive and sess.net_degrade > 0:
+            why.append(f"Автоадаптация сети временно снизила поток (ступень {sess.net_degrade})")
+        # Не дублируем одинаковые причины между валидацией и текущим состоянием.
+        why = list(dict.fromkeys(why))
+        return {
+            "selected": {
+                "fps": sess.fps, "quality": sess.quality,
+                "scale": sess.scale, "profile": sess.profile,
+                "adaptive": sess.adaptive,
+            },
+            "applied": {"fps": fps, "quality": quality, "scale": scale},
+            "limits": self._stream_limits(user),
+            "reasons": why,
+        }
+
+    def _apply_stream_config(self, sess, data, user):
+        """Безопасно применяет настройки потока и возвращает подтверждение.
+
+        Старые клиенты продолжают работать: отсутствующие поля не меняют
+        состояние. Новые получают selected/applied и видят все ограничения.
+        """
+        limits = self._stream_limits(user)
+        requested_fps = int(round(self._stream_number(data.get("fps"), sess.fps)))
+        requested_quality = int(round(self._stream_number(
+            data.get("quality"), sess.quality)))
+        requested_scale = self._stream_number(data.get("scale"), sess.scale)
+        fps = max(limits["min_fps"], min(limits["max_fps"], requested_fps))
+        quality = max(limits["min_quality"],
+                      min(limits["max_quality"], requested_quality))
+        scale = max(limits["min_scale"], min(limits["max_scale"], requested_scale))
+        reasons = []
+        if requested_fps > limits["max_fps"]:
+            reasons.append(f"Для этой учётной записи разрешено не больше {limits['max_fps']} FPS")
+        elif requested_fps < limits["min_fps"]:
+            reasons.append(f"Минимальное значение — {limits['min_fps']} FPS")
+        if requested_quality != quality:
+            reasons.append(f"Качество ограничено диапазоном Q{limits['min_quality']}–Q{limits['max_quality']}")
+        if requested_scale != scale:
+            reasons.append("Масштаб ограничен диапазоном 25–100%")
+
+        old_effective = self._stream_params(sess)
+        old_selected = (sess.fps, sess.quality, sess.scale, sess.adaptive, sess.profile)
+        profile = data.get("profile")
+        if profile in capability.STREAM_PROFILES:
+            sess.profile = profile
+        adaptive = data.get("adaptive", sess.adaptive)
+        if isinstance(adaptive, bool):
+            sess.adaptive = adaptive
+
+        sess.fps, sess.quality, sess.scale = fps, quality, scale
+        sess.user = user
+        sess.net_degrade = 0
+        new_effective = self._stream_params(sess)
+        image_params_changed = (int(old_effective[1]) != int(new_effective[1])
+                                or abs(old_effective[2] - new_effective[2]) > 1e-6)
+        changed = old_selected != (sess.fps, sess.quality, sess.scale,
+                                   sess.adaptive, sess.profile)
+        if image_params_changed:
+            sess.force_full = True
+        self._refresh_capture_fps()
+        if changed or old_effective != new_effective:
+            self._notify_frame()
+        state_payload = self._stream_state(sess, user, reasons)
+        return {"type": "config_applied", "request_id": data.get("request_id"),
+                **state_payload}
+
     def _stream_params(self, sess):
         """Эффективные FPS/качество/масштаб с учётом режима «только работа»."""
         fps, q, s = sess.effective()
@@ -772,7 +985,7 @@ class HostServer:
     async def _encoded(self, frame, quality, scale, region=None):
         """Кодирование с общим кэшем: один и тот же кадр/область с одинаковыми
         параметрами кодируется один раз на все сессии."""
-        key = (frame[4], int(quality), round(scale, 2), region)
+        key = (frame[4], int(quality), round(scale, 6), region)
         fut = self._enc_jobs.get(key)
         if fut is None:
             loop = asyncio.get_running_loop()
@@ -835,21 +1048,40 @@ class HostServer:
         if auth.has_users():
             raise web.HTTPBadRequest(text="owner уже создан")
         d = await request.json()
-        auth.create_user(d["username"], d["password"], role="owner",
-                         profile="dev", priority="critical", actor="setup")
+        try:
+            auth.create_user(d["username"], d["password"], role="owner",
+                             profile="dev", priority="critical", actor="setup")
+        except (ValueError, KeyError) as e:
+            raise web.HTTPBadRequest(text=str(e))
         return web.json_response({"ok": True})
 
     async def api_login(self, request):
         d = await request.json()
-        u = auth.verify(d.get("username", ""), d.get("password", ""))
+        remote = request.remote or "unknown"
+        retry_after = self._login_retry_after(remote)
+        if retry_after:
+            raise web.HTTPTooManyRequests(
+                text=f"Слишком много попыток. Повторите через {retry_after} сек.",
+                headers={"Retry-After": str(retry_after)})
+        username = str(d.get("username", "")).strip()
+        u = auth.verify(username, d.get("password", ""))
         if not u:
-            state.audit("login.fail", d.get("username", "?"), {"ip": request.remote})
+            self._login_failed(remote)
+            state.audit("login.fail", username or "?", {"ip": request.remote})
             raise web.HTTPUnauthorized(text="Неверные учётные данные, блокировка или истёкший доступ")
-        token = auth.issue_token(d["username"])
-        state.audit("login.ok", d["username"], {"ip": request.remote})
+        self._login_succeeded(remote)
+        token = auth.issue_token(username)
+        state.audit("login.ok", username, {"ip": request.remote})
         return web.json_response({"token": token, "role": u["role"],
+                                  "username": username,
                                   "profile": u.get("profile", "office"),
                                   "permissions": self._permission_payload(u)})
+
+    async def api_admin_me(self, request):
+        username, user = self._admin_identity(request)
+        if not user:
+            raise web.HTTPUnauthorized(text="Сеанс панели истёк. Войдите снова.")
+        return web.json_response({"username": username, "role": user.get("role")})
 
     async def api_redeem(self, request):
         d = await request.json()
@@ -870,6 +1102,8 @@ class HostServer:
                                   "config": self.config})
 
     async def api_load(self, request):
+        if not self._admin(request):
+            raise web.HTTPForbidden()
         return web.json_response(await self._get_load())
 
     async def api_users(self, request):
@@ -878,56 +1112,67 @@ class HostServer:
         return web.json_response(auth.list_users())
 
     async def api_user_create(self, request):
-        actor = self._admin(request)
-        if not actor:
+        actor, actor_user = self._admin_identity(request)
+        if not actor_user:
             raise web.HTTPForbidden()
         d = await request.json()
+        role = d.get("role", "user")
+        if role == "owner":
+            raise web.HTTPForbidden(text="Назначение владельца через панель запрещено")
+        if role == "admin" and actor_user.get("role") != "owner":
+            raise web.HTTPForbidden(text="Только владелец может назначать администраторов")
         try:
             auth.create_user(d["username"], d["password"],
-                             role=d.get("role", "user"), profile=d.get("profile", "office"),
+                             role=role, profile=d.get("profile", "office"),
                              priority=d.get("priority", "normal"),
                              allow_input=d.get("allow_input", True),
                              allow_clipboard=d.get("allow_clipboard", False),
                              allow_files=d.get("allow_files", False),
-                             max_fps=int(d.get("max_fps", 60)), actor=actor)
+                             max_fps=int(d.get("max_fps", 60)),
+                             disk_quota_mb=int(d.get("disk_quota_mb", 2048)), actor=actor)
         except ValueError as e:
             raise web.HTTPBadRequest(text=str(e))
         return web.json_response({"ok": True})
 
     async def api_user_update(self, request):
-        actor = self._admin(request)
-        if not actor:
-            raise web.HTTPForbidden()
         d = await request.json()
+        username = str(d.get("username", "")).strip()
+        fields = d.get("fields", {})
+        destructive = bool(fields.get("blocked"))
+        actor, _, _ = self._can_manage_user(
+            request, username, new_role=fields.get("role"), destructive=destructive)
         try:
-            auth.update_user(d["username"], d.get("fields", {}), actor=actor)
+            auth.update_user(username, fields, actor=actor)
         except ValueError as e:
             raise web.HTTPBadRequest(text=str(e))
-        if d.get("fields", {}).get("blocked"):
-            auth.revoke_user_tokens(d["username"])
-            for s in list(self.sessions.values()):
-                if s.username == d["username"]:
-                    await self._kick(s, "Пользователь заблокирован")
+        current_user = auth.get_user(username)
+        for session in list(self.sessions.values()):
+            if session.username != username:
+                continue
+            session.user = current_user
+            session.priority = current_user.get("priority", session.priority)
+            if fields.get("blocked"):
+                await self._kick(session, "Пользователь заблокирован")
+        if fields.get("blocked"):
+            auth.revoke_user_tokens(username)
         return web.json_response({"ok": True})
 
     async def api_user_password(self, request):
-        actor = self._admin(request)
-        if not actor:
-            raise web.HTTPForbidden()
         d = await request.json()
+        username = str(d.get("username", "")).strip()
+        actor, _, _ = self._can_manage_user(request, username)
         try:
-            auth.set_password(d["username"], d.get("password", ""), actor=actor)
+            auth.set_password(username, d.get("password", ""), actor=actor)
         except (ValueError, KeyError) as e:
             raise web.HTTPBadRequest(text=str(e))
         return web.json_response({"ok": True})
 
     async def api_reset_create(self, request):
-        actor = self._admin(request)
-        if not actor:
-            raise web.HTTPForbidden()
         d = await request.json()
+        username = str(d.get("username", "")).strip()
+        actor, _, _ = self._can_manage_user(request, username)
         try:
-            code = auth.create_reset_code(d["username"],
+            code = auth.create_reset_code(username,
                                           ttl_hours=float(d.get("ttl_hours", 1)), actor=actor)
         except (ValueError, KeyError) as e:
             raise web.HTTPBadRequest(text=str(e))
@@ -945,14 +1190,104 @@ class HostServer:
             raise web.HTTPBadRequest(text=str(e))
         return web.json_response({"ok": True, "username": username})
 
+    async def api_files(self, request):
+        username, user = self._file_identity(request)
+        root = self._user_file_dir(username, user)
+        files = []
+        for path in root.iterdir():
+            try:
+                if not path.is_file() or path.is_symlink() or path.name.startswith(".upload-"):
+                    continue
+                stat = path.stat()
+                files.append({"name": path.name, "size": stat.st_size,
+                              "modified": int(stat.st_mtime)})
+            except OSError:
+                continue
+        files.sort(key=lambda item: item["modified"], reverse=True)
+        used = sum(item["size"] for item in files)
+        quota = int(user.get("disk_quota_mb", 2048)) * 2**20
+        return web.json_response({"files": files, "used": used, "quota": quota,
+                                  "max_upload": MAX_UPLOAD_MB * 2**20})
+
+    async def api_file_upload(self, request):
+        username, user = self._file_identity(request)
+        try:
+            reader = await request.multipart()
+            field = await reader.next()
+        except (AssertionError, ValueError):
+            raise web.HTTPBadRequest(text="Ожидался файл")
+        if field is None or field.name != "file" or not field.filename:
+            raise web.HTTPBadRequest(text="Файл не выбран")
+
+        name = self._safe_filename(field.filename)
+        root = self._user_file_dir(username, user)
+        destination = root / name
+        if destination.is_symlink():
+            raise web.HTTPBadRequest(text="Недопустимый путь файла")
+        existing_size = destination.stat().st_size if destination.exists() else 0
+        quota = int(user.get("disk_quota_mb", 2048)) * 2**20
+        baseline = max(0, self._file_usage(root) - existing_size)
+        max_size = min(MAX_UPLOAD_MB * 2**20, quota - baseline)
+        if max_size < 0:
+            raise web.HTTPRequestEntityTooLarge(max_size=quota, actual_size=baseline)
+
+        temp_path = root / f".upload-{uuid.uuid4().hex}"
+        size = 0
+        try:
+            with open(temp_path, "xb") as file:
+                while True:
+                    chunk = await field.read_chunk(size=64 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_size:
+                        raise web.HTTPRequestEntityTooLarge(max_size=max_size,
+                                                            actual_size=size)
+                    file.write(chunk)
+                file.flush()
+                os.fsync(file.fileno())
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_path, destination)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        state.audit("file.upload", username, {"name": name, "size": size})
+        return web.json_response({"ok": True, "name": name, "size": size})
+
+    async def api_file_download(self, request):
+        username, user = self._file_identity(request)
+        name = self._safe_filename(request.match_info.get("name"))
+        path = self._user_file_dir(username, user) / name
+        if not path.is_file() or path.is_symlink():
+            raise web.HTTPNotFound(text="Файл не найден")
+        state.audit("file.download", username, {"name": name, "size": path.stat().st_size})
+        return web.FileResponse(
+            path, headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"})
+
+    async def api_file_delete(self, request):
+        username, user = self._file_identity(request)
+        data = await request.json()
+        name = self._safe_filename(data.get("name"))
+        path = self._user_file_dir(username, user) / name
+        if not path.is_file() or path.is_symlink():
+            raise web.HTTPNotFound(text="Файл не найден")
+        size = path.stat().st_size
+        path.unlink()
+        state.audit("file.delete", username, {"name": name, "size": size})
+        return web.json_response({"ok": True})
+
     async def api_user_delete(self, request):
-        actor = self._admin(request)
-        if not actor:
-            raise web.HTTPForbidden()
         d = await request.json()
-        auth.delete_user(d["username"], actor=actor)
+        username = str(d.get("username", "")).strip()
+        actor, _, _ = self._can_manage_user(request, username, destructive=True)
+        auth.delete_user(username, actor=actor)
         for s in list(self.sessions.values()):
-            if s.username == d["username"]:
+            if s.username == username:
                 await self._kick(s, "Доступ отозван")
         return web.json_response({"ok": True})
 
@@ -962,15 +1297,24 @@ class HostServer:
         return web.json_response(auth.list_invites())
 
     async def api_invite_create(self, request):
-        actor = self._admin(request)
-        if not actor:
+        actor, actor_user = self._admin_identity(request)
+        if not actor_user:
             raise web.HTTPForbidden()
         d = await request.json()
-        code = auth.create_invite(role=d.get("role", "guest"), profile=d.get("profile", "office"),
-                                  ttl_hours=float(d.get("ttl_hours", 24)),
-                                  priority=d.get("priority", "low"),
-                                  allow_input=d.get("allow_input", True),
-                                  session_hours=d.get("session_hours"), actor=actor)
+        role = d.get("role", "guest")
+        if role not in ("guest", "user"):
+            raise web.HTTPForbidden(text="Приглашение может создать только гостя или пользователя")
+        try:
+            code = auth.create_invite(role=role, profile=d.get("profile", "office"),
+                                      ttl_hours=float(d.get("ttl_hours", 24)),
+                                      priority=d.get("priority", "low"),
+                                      allow_input=d.get("allow_input", True),
+                                      allow_clipboard=d.get("allow_clipboard", False),
+                                      allow_files=d.get("allow_files", False),
+                                      session_hours=d.get("session_hours"),
+                                      disk_quota_mb=d.get("disk_quota_mb", 512), actor=actor)
+        except (TypeError, ValueError) as e:
+            raise web.HTTPBadRequest(text=str(e))
         return web.json_response({"code": code})
 
     async def api_invite_revoke(self, request):
@@ -1002,10 +1346,18 @@ class HostServer:
         if not actor:
             raise web.HTTPForbidden()
         d = await request.json()
-        for k in ("accepting", "work_only_mode", "owner_gaming_mode",
-                  "owner_reserve_percent", "max_sessions", "host_name"):
-            if k in d:
-                self.config[k] = d[k]
+        for key in ("accepting", "work_only_mode", "owner_gaming_mode"):
+            if key in d:
+                self.config[key] = bool(d[key])
+        if "owner_reserve_percent" in d:
+            self.config["owner_reserve_percent"] = max(0, min(80, int(d["owner_reserve_percent"])))
+        if "max_sessions" in d:
+            self.config["max_sessions"] = max(1, min(64, int(d["max_sessions"])))
+        if "host_name" in d:
+            name = str(d["host_name"] or "").strip()
+            if len(name) > 64 or any(ord(ch) < 32 for ch in name):
+                raise web.HTTPBadRequest(text="Имя хоста должно быть короче 65 символов")
+            self.config["host_name"] = name or None
         state.save_config(self.config)
         state.audit("settings.update", actor, d)
         return web.json_response({"ok": True, "config": self.config})
@@ -1029,10 +1381,14 @@ class HostServer:
         await ws.prepare(request)
         try:
             while not ws.closed:
+                if not self._admin(request):
+                    await ws.close(code=4003, message=b"admin session expired")
+                    break
                 await ws.send_json({
                     "type": "tick",
                     "load": await self._get_load(),
-                    "sessions": [s.info() for s in self.sessions.values()],
+                    "sessions": [s.info(self._stream_params(s))
+                                 for s in self.sessions.values()],
                     "config": self.config,
                     "capture_ok": CAPTURE_OK, "input_ok": INPUT_OK,
                 })
@@ -1066,6 +1422,7 @@ class HostServer:
         state.log_session_event("connect", {"sid": sess.sid, "username": username,
                                             "ip": sess.ip, "route": sess.route})
         scr = [self.capture.frame[1], self.capture.frame[2]] if self.capture.frame else None
+        stream_state = self._stream_state(sess, user)
         await ws.send_json({"type": "hello", "sid": sess.sid,
                             "host_name": self.host_name(),
                             "route": sess.route,
@@ -1073,6 +1430,8 @@ class HostServer:
                             "screen": scr,
                             "profile": sess.profile,
                             "fps": sess.fps, "quality": sess.quality, "scale": sess.scale,
+                            "stream": stream_state,
+                            "limits": stream_state["limits"],
                             "permissions": self._permission_payload(user),
                             "isolation_note": "MVP: все удалённые сессии видят общий рабочий стол хоста. "
                                               "Изоляция через VM — этап 2."})
@@ -1089,32 +1448,30 @@ class HostServer:
                 except json.JSONDecodeError:
                     continue
                 t = d.get("type")
+                current_user = auth.get_user(username)
+                if not auth.user_is_active(current_user):
+                    await self._kick(sess, "Доступ истёк или был отозван")
+                    break
                 if t == "ping":
                     await ws.send_json({"type": "pong", "t": d.get("t")})
                 elif t == "config":
-                    sess.fps = min(int(d.get("fps", sess.fps)), self._fps_cap(user))
-                    sess.quality = max(20, min(95, int(d.get("quality", sess.quality))))
-                    sess.scale = max(0.25, min(1.0, float(d.get("scale", sess.scale))))
-                    if d.get("profile") in capability.STREAM_PROFILES:
-                        sess.profile = d["profile"]
-                    sess.net_degrade = 0   # пользователь сменил настройки — начинаем заново
-                    self._refresh_capture_fps()
+                    await ws.send_json(self._apply_stream_config(sess, d, current_user))
                 elif t == "refresh":
                     # клиент просит полный кадр (потерял дельта-цепочку)
                     sess.force_full = True
                     self._notify_frame()
                 elif t == "input":
-                    current_user = auth.get_user(username) or user
                     if self._input_permission(current_user)[0]:
-                        for ev in d.get("events", []):
+                        for ev in d.get("events", [])[:256]:
                             self.injector.apply(ev)
-                elif t == "clipboard_get" and user.get("allow_clipboard"):
+                elif t == "clipboard_get" and current_user.get("allow_clipboard"):
                     loop = asyncio.get_running_loop()
                     text = await loop.run_in_executor(_executor, clipboard_get)
                     await ws.send_json({"type": "clipboard", "text": text or ""})
-                elif t == "clipboard_set" and user.get("allow_clipboard"):
+                elif t == "clipboard_set" and current_user.get("allow_clipboard"):
+                    text = str(d.get("text", ""))[:1_000_000]
                     await asyncio.get_running_loop().run_in_executor(
-                        _executor, clipboard_set, d.get("text", ""))
+                        _executor, clipboard_set, text)
         finally:
             sender.cancel()
             stats.cancel()
@@ -1137,7 +1494,8 @@ class HostServer:
         Адаптация к каналу: резкий затык → мгновенная ступень деградации."""
         last_seq = -1
         last_params = None
-        last_pick = 0.0            # monotonic-время выбора последнего кадра
+        next_pick = 0.0            # следующий дедлайн кадра (с переносом остатка)
+        last_fps = None
         last_full_t = 0.0
         dirty_since_full = False
         send_ewma = 0.0
@@ -1146,25 +1504,36 @@ class HostServer:
             ev = self._frame_evt
             fps, quality, scale = self._stream_params(sess)
             budget = 1.0 / max(fps, 1)
+            if fps != last_fps:
+                next_pick = 0.0
+                last_fps = fps
             frame = self.capture.frame
             now = time.monotonic()
-            params = (int(quality), round(scale, 2))
+            params = (int(quality), round(scale, 6))
             heal = dirty_since_full and now - last_full_t >= 5.0
             changed = frame is not None and (
                 frame[4] != last_seq or params != last_params
                 or sess.force_full or heal)
-            if not changed or now < last_pick + budget * 0.75:
+            if not changed or (next_pick and now < next_pick):
                 # Ждём СОБЫТИЕ нового кадра, а не таймер: системный таймер
                 # Windows тикает ~15.6 мс и таймерный пейсинг режет FPS вдвое.
+                timeout = 0.25
+                if changed and next_pick:
+                    timeout = min(timeout, max(0.001, next_pick - now))
                 if ev is None:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(min(0.05, timeout))
                 else:
                     try:
-                        await asyncio.wait_for(ev.wait(), timeout=0.25)
+                        await asyncio.wait_for(ev.wait(), timeout=timeout)
                     except asyncio.TimeoutError:
                         pass
                 continue
-            last_pick = now
+            if not next_pick or now - next_pick > budget * 4:
+                next_pick = now + budget
+            else:
+                next_pick += budget
+                while next_pick <= now:
+                    next_pick += budget
             region = None
             if (not sess.force_full and not heal
                     and params == last_params and last_seq >= 0):
@@ -1196,15 +1565,18 @@ class HostServer:
             send_dt = time.perf_counter() - t0
             send_ewma = send_dt if not send_ewma else send_ewma * 0.7 + send_dt * 0.3
             now2 = time.monotonic()
-            if send_dt > max(0.25, budget * 4) and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
-                sess.net_degrade += 1      # резкий затык канала — реагируем сразу
-                last_adapt = now2
-            elif send_ewma > budget * 1.4 and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
-                sess.net_degrade += 1
-                last_adapt = now2
-            elif send_ewma < budget * 0.4 and sess.net_degrade > 0 and now2 - last_adapt > 6.0:
-                sess.net_degrade -= 1
-                last_adapt = now2
+            if sess.adaptive:
+                if send_dt > max(0.25, budget * 4) and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
+                    sess.net_degrade += 1  # резкий затык канала — реагируем сразу
+                    last_adapt = now2
+                elif send_ewma > budget * 1.4 and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
+                    sess.net_degrade += 1
+                    last_adapt = now2
+                elif send_ewma < budget * 0.4 and sess.net_degrade > 0 and now2 - last_adapt > 6.0:
+                    sess.net_degrade -= 1
+                    last_adapt = now2
+            elif sess.net_degrade:
+                sess.net_degrade = 0
             sess.frames += 1
             sess.bytes += len(msg)
             nowt = time.time()
@@ -1215,9 +1587,14 @@ class HostServer:
 
     async def _stats_sender(self, sess):
         while not sess.ws.closed:
+            user = auth.get_user(sess.username)
+            if not auth.user_is_active(user):
+                await self._kick(sess, "Доступ истёк или был отозван")
+                break
             load = await self._get_load()
             fps, quality, scale = self._stream_params(sess)
-            user = auth.get_user(sess.username) or sess.user
+            sess.user = user
+            sess.priority = user.get("priority", sess.priority)
             warn = list(sess.warnings)
             if sess.degrade > 0:
                 warn.append(f"Хост перегружен: применена ступень деградации {sess.degrade} "
@@ -1229,10 +1606,11 @@ class HostServer:
             try:
                 await sess.ws.send_json({
                     "type": "stats", "host": load,
-                    "session": sess.info(),
+                    "session": sess.info((fps, quality, scale)),
                     "codec": "MJPEG", "capture": self.capture.backend,
                     "route": sess.route,
                     "fps_target": fps, "quality": quality, "scale": scale,
+                    "stream": self._stream_state(sess, user),
                     "permissions": self._permission_payload(user),
                     "warnings": warn,
                 })

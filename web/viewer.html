@@ -16,7 +16,8 @@ canvas#cv {
   position:fixed; top:0; left:50%; transform:translateX(-50%);
   display:flex; gap:6px; padding:6px 10px; background:rgba(14,17,23,.92);
   border:1px solid #2a3245; border-top:0; border-radius:0 0 10px 10px; z-index:20;
-  transition:opacity .35s, transform .35s; align-items:center; flex-wrap:wrap; max-width:98vw;
+  transition:opacity .35s, transform .35s; align-items:center; justify-content:center;
+  flex-wrap:wrap; width:max-content; max-width:98vw;
 }
 #toolbar.hidden { opacity:0; transform:translateX(-50%) translateY(-85%); }
 #toolbar.hidden:hover, #toolbar:hover { opacity:1; transform:translateX(-50%); }
@@ -27,6 +28,8 @@ button, select {
 button.acc { background:var(--acc); border-color:var(--acc); }
 button.on { background:var(--ok); border-color:var(--ok); color:#06210f; }
 button.danger { background:var(--err); border-color:var(--err); }
+select option:disabled { color:#687086; }
+#streamStatus { white-space:nowrap; max-width:250px; overflow:hidden; text-overflow:ellipsis; }
 #overlay {
   position:fixed; top:10px; left:10px; z-index:15; min-width:250px;
   background:rgba(10,13,19,.85); border:1px solid #2a3245; border-radius:10px;
@@ -48,6 +51,19 @@ button.danger { background:var(--err); border-color:var(--err); }
 .badge { padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; }
 .b-ok { background:rgba(62,207,142,.15); color:var(--ok); }
 .b-acc { background:rgba(79,140,255,.15); color:var(--acc); }
+.b-warn { background:rgba(245,181,69,.15); color:var(--warn); }
+dialog {
+  width:min(680px,94vw); max-height:80vh; overflow:auto; padding:18px;
+  color:var(--fg); background:#161b25; border:1px solid #2a3245; border-radius:8px;
+}
+dialog::backdrop { background:rgba(0,0,0,.7); }
+.file-head { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+.file-head h2 { margin:0; font-size:16px; }
+.file-head .grow { flex:1; }
+#fileTable { width:100%; border-collapse:collapse; }
+#fileTable th, #fileTable td { padding:7px 8px; text-align:left; border-bottom:1px solid #2a3245; }
+#fileTable th { color:#8b93a7; font-weight:500; }
+#fileState { min-height:18px; margin-top:10px; color:#8b93a7; }
 </style>
 </head>
 <body>
@@ -62,9 +78,18 @@ button.danger { background:var(--err); border-color:var(--err); }
     <option value="game">Игры</option><option value="competitive">Соревн.</option>
     <option value="custom">Свой</option>
   </select>
-  <select id="selFps" onchange="sendConfig()" title="FPS"><option>15</option><option>30</option><option>60</option><option>90</option><option>120</option><option>144</option></select>
-  <select id="selQ" onchange="sendConfig()" title="Качество"><option value="40">Q40</option><option value="55">Q55</option><option value="70">Q70</option><option value="85">Q85</option></select>
-  <select id="selRes" onchange="sendConfig()" title="Разрешение потока"><option value="1">Разрешение…</option></select>
+  <select id="selFps" onchange="manualConfigChanged()" title="Частота передачи кадров"><option>15</option><option>30</option><option>60</option><option>90</option><option>120</option><option>144</option></select>
+  <select id="selQ" onchange="manualConfigChanged()" title="Качество JPEG">
+    <option value="40">Q40 · экономно</option><option value="55">Q55 · офис</option>
+    <option value="60">Q60 · плавность</option><option value="70">Q70 · чётко</option>
+    <option value="75">Q75 · видео</option><option value="80">Q80 · высокое</option>
+    <option value="85">Q85 · очень высокое</option><option value="95">Q95 · максимум</option>
+  </select>
+  <select id="selRes" onchange="manualConfigChanged()" title="Разрешение потока"><option value="1">Разрешение…</option></select>
+  <select id="selAdaptive" onchange="sendConfig()" title="Авто снижает параметры при проблемах сети; фиксированный режим сохраняет выбранные значения">
+    <option value="auto">Авто</option><option value="fixed">Фикс.</option>
+  </select>
+  <span id="streamStatus" class="badge b-acc" title="Параметры потока">Ожидание хоста…</span>
   <button id="btnInput" onclick="toggleInput()">⌨️ Ввод: вкл</button>
   <button id="btnKeys" onclick="toggleKeyMode()" title="Текст: печатает символы как есть (любая раскладка, точки, кириллица). Игра: клавиши как физические кнопки (WASD с удержанием).">⌨️ Набор: текст</button>
   <button id="btnCapture" onclick="toggleCaptureMode()" title="Захват мыши: курсор не выходит за окно и не задевает меню/док Mac. Выход: удерживайте Esc.">🔒 Захват</button>
@@ -72,6 +97,7 @@ button.danger { background:var(--err); border-color:var(--err); }
   <button onclick="langSwitch()" title="Переключить язык ввода НА ХОСТЕ (Win+Space). Для набора текста обычно не нужно — печатайте в своей раскладке.">🌐</button>
   <button onclick="clipSend()" id="btnClipS" title="Отправить буфер обмена на хост">📋→</button>
   <button onclick="clipGet()" id="btnClipG" title="Получить буфер обмена хоста">→📋</button>
+  <button onclick="openFiles()" id="btnFiles" title="Личные файлы на хосте" style="display:none">📁 Файлы</button>
   <button id="btnFs" onclick="toggleFs()" title="Полноэкранный режим">⛶</button>
   <button class="danger" onclick="disconnect()">✕ Отключиться</button>
 </div>
@@ -79,10 +105,34 @@ button.danger { background:var(--err); border-color:var(--err); }
 <div id="hint"></div>
 <div id="overlay"></div>
 
+<dialog id="dlgFiles">
+  <div class="file-head">
+    <h2>Личные файлы</h2>
+    <span id="fileUsage" class="badge b-acc">—</span>
+    <span class="grow"></span>
+    <button onclick="dlgFiles.close()">Закрыть</button>
+  </div>
+  <div class="file-head">
+    <input id="fileInput" type="file">
+    <button id="btnUpload" class="acc" onclick="uploadFile()">Загрузить</button>
+    <button onclick="loadFiles()">Обновить</button>
+  </div>
+  <table id="fileTable">
+    <thead><tr><th>Имя</th><th>Размер</th><th>Изменён</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="fileState"></div>
+</dialog>
+
 <script>
 const P = new URLSearchParams(location.search);
-const HOST = P.get('host'), PORT = P.get('port'), TOKEN = P.get('token');
+const SECRET = new URLSearchParams(location.hash.slice(1));
+const HOST = P.get('host'), PORT = P.get('port'), TOKEN = SECRET.get('token');
+if (location.hash) history.replaceState(null, '', location.pathname + location.search);
 const $ = s => document.querySelector(s);
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+})[ch]);
 const cv = $('#cv'), ctx = cv.getContext('2d');
 const base = document.createElement('canvas');       // содержимое экрана хоста
 const bctx = base.getContext('2d');
@@ -92,9 +142,10 @@ const clamp = v => v < 0 ? 0 : v > 1 ? 1 : v;
 const IS_MAC = /Mac|iPhone|iPad/i.test(navigator.platform || '')
   || /Mac/i.test((navigator.userAgentData && navigator.userAgentData.platform) || '');
 
-let ws, hello = null, lastStats = null;
+let ws, hello = null, lastStats = null, streamState = null;
+let configSeq = 0, lastConfigAck = 0;
 let inputEnabled = true, overlayOn = true;
-let permissions = {input:false, clipboard:false};
+let permissions = {input:false, clipboard:false, files:false};
 let captureMode = IS_MAC;   // клик по экрану захватывает мышь (актуально для Mac)
 let captured = false;       // сейчас Pointer Lock активен
 let macKeys = IS_MAC;       // Cmd -> Ctrl
@@ -112,9 +163,20 @@ let rtts = [], ping = 0, jitter = 0;
 let decodeMs = 0, frameGapMs = 0, lastFrameT = 0;
 let framesDropped = 0;
 
-$('#selFps').value = P.get('fps') || '60';
-$('#selQ').value = P.get('quality') || '70';
+function ensureSelectValue(select, value, label) {
+  const stringValue = String(value);
+  let option = [...select.options].find(item => item.value === stringValue);
+  if (!option) {
+    option = document.createElement('option');
+    option.value = stringValue; option.textContent = label || stringValue;
+    select.appendChild(option);
+  }
+  select.value = stringValue;
+}
+ensureSelectValue($('#selFps'), P.get('fps') || '60');
+ensureSelectValue($('#selQ'), P.get('quality') || '70', `Q${P.get('quality')}`);
 $('#selProfile').value = P.get('profile') || 'dev';
+$('#selAdaptive').value = P.get('adaptive') === '0' ? 'fixed' : 'auto';
 
 // ================== КУРСОР: рисуется ПРЯМО В CANVAS ==================
 // Никаких DOM-слоёв: курсор компонуется с кадром при отрисовке, поэтому он
@@ -199,7 +261,7 @@ requestAnimationFrame(renderLoop);
 function connect() {
   ws = new WebSocket(`ws://${HOST}:${PORT}/ws/stream?token=${encodeURIComponent(TOKEN)}`);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { sendConfig(); };
+  ws.onopen = () => setStreamStatus(null, true);
   ws.onmessage = onMsg;
   ws.onclose = e => showMsg('Сессия завершена', e.reason || 'Соединение закрыто хостом');
   ws.onerror = () => showMsg('Ошибка подключения',
@@ -216,7 +278,7 @@ function hint(text, ttl) {
   const h = $('#hint');
   clearTimeout(hintTimer);
   if (!text) { h.style.display = 'none'; return; }
-  h.textContent = text; h.style.display = '';
+  h.textContent = text; h.style.display = 'block';
   if (ttl) hintTimer = setTimeout(() => { h.style.display = 'none'; }, ttl);
 }
 
@@ -277,6 +339,7 @@ async function drainFrames() {
 async function onText(d) {
   if (d.type === 'hello') {
     hello = d;
+    applyHostLimits(d.limits || (d.stream && d.stream.limits));
     applyPermissions(d.permissions || {});
     document.title = `App_Remote — ${d.host_name}`;
     $('#msg').style.display = 'none';
@@ -292,6 +355,12 @@ async function onText(d) {
     if (captureMode && permissions.input) {
       hint('Кликните по экрану — мышь захватится (полный экран). Выход: удерживайте Esc.', 6000);
     }
+  } else if (d.type === 'config_applied') {
+    const requestId = Number(d.request_id) || 0;
+    if (!requestId || requestId >= lastConfigAck) {
+      lastConfigAck = requestId;
+      applyStreamState(d, true);
+    }
   } else if (d.type === 'pong') {
     const rtt = performance.now() - d.t;
     rtts.push(rtt); if (rtts.length > 20) rtts.shift();
@@ -301,6 +370,14 @@ async function onText(d) {
   } else if (d.type === 'stats') {
     lastStats = d;
     if (d.permissions) applyPermissions(d.permissions);
+    if (d.stream) applyStreamState(d.stream, false);
+    else applyStreamState({
+      selected: (d.session && d.session.requested) || {
+        fps:+$('#selFps').value, quality:+$('#selQ').value,
+        scale:+$('#selRes').value || 1,
+        adaptive:$('#selAdaptive').value === 'auto', profile:$('#selProfile').value},
+      applied:{fps:d.fps_target, quality:d.quality, scale:d.scale}, reasons:[]
+    }, false);
   } else if (d.type === 'cursor') {
     const c = d.cursor || {};
     if (c.type) hostCursorType = c.type;
@@ -325,22 +402,25 @@ function renderOverlay() {
   ov.style.display = overlayOn ? '' : 'none';
   if (!overlayOn) return;
   const s = lastStats || {}, h = s.host || {}, sess = s.session || {};
+  const selected = (streamState && streamState.selected) || sess.requested || {};
+  const applied = (streamState && streamState.applied) || {};
   const route = s.route || (hello && hello.route) || '—';
   const routeCls = route === 'LAN Direct' ? 'b-ok' : 'b-acc';
-  const warn = (s.warnings || []).map(w => `<div class="w">⚠ ${w}</div>`).join('');
+  const warn = (s.warnings || []).map(w => `<div class="w">⚠ ${esc(w)}</div>`).join('');
   const inputWarn = permissions.input ? '' : `<div class="e">${inputReasonText()}</div>`;
   const inputLat = ping ? (ping / 2 + frameGapMs / 2).toFixed(0) : '—';
   const modeTxt = captured ? 'захват мыши' : (inputEnabled ? 'оконный' : 'просмотр');
   const total = deltaCnt + fullCnt;
   const deltaShare = total ? Math.round(deltaCnt * 100 / total) : 0;
   ov.innerHTML = `
-    <span class="badge ${routeCls}">${route}</span> <b>${hello ? hello.host_name : ''}</b>
+    <span class="badge ${routeCls}">${esc(route)}</span> <b>${esc(hello ? hello.host_name : '')}</b>
     <div class="sec">ПОТОК</div>
-    FPS: <b>${fpsShown}</b> (цель ${s.fps_target ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
+    FPS: <b>${fpsShown}</b> (применено ${applied.fps ?? s.fps_target ?? $('#selFps').value}, выбрано ${selected.fps ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
     Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>MJPEG-дельта</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
     Поток: <b>${cv.width}×${cv.height}</b> · Мой экран: <b>${Math.round(screen.width*(devicePixelRatio||1))}×${Math.round(screen.height*(devicePixelRatio||1))}</b><br>
     Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>
-    Профиль: <b>${sess.profile || $('#selProfile').value}</b> · Q${s.quality ?? '—'} · Режим: <b>${modeTxt}</b> · Набор: <b>${keyMode === 'text' ? 'текст' : 'игра'}</b>
+    Профиль: <b>${esc(sess.profile || $('#selProfile').value)}</b> · Q${esc(applied.quality ?? s.quality ?? '—')} (выбрано Q${esc(selected.quality ?? $('#selQ').value)}) · Адаптация: <b>${selected.adaptive === false ? 'фикс.' : 'авто'}</b><br>
+    Режим: <b>${modeTxt}</b> · Набор: <b>${keyMode === 'text' ? 'текст' : 'игра'}</b>
     <div class="sec">ЗАДЕРЖКИ</div>
     Ping: <b>${ping.toFixed(1)} мс</b> · Jitter: <b>${jitter.toFixed(1)} мс</b><br>
     Ввод (оценка): <b>~${inputLat} мс</b> · Декодирование: <b>${decodeMs.toFixed(1)} мс</b><br>
@@ -354,43 +434,108 @@ function renderOverlay() {
 
 // ------- выбор разрешения потока (по родному разрешению хоста)
 const RES_LIST = [[3840,2160],[2560,1440],[2048,1152],[1920,1080],[1600,900],[1366,768],[1280,720]];
+function streamDimensions(scale) {
+  const [nw, nh] = nativeWH();
+  const value = Math.max(0.25, Math.min(1, Number(scale) || 1));
+  return [Math.max(2, Math.floor(nw * value / 2) * 2),
+          Math.max(2, Math.floor(nh * value / 2) * 2)];
+}
+function findScaleOption(scale) {
+  return [...$('#selRes').options].find(option =>
+    Math.abs(Number(option.value) - Number(scale)) < 0.00001);
+}
+function addScaleOption(scale, prefix='') {
+  const value = Math.max(0.25, Math.min(1, Number(scale) || 1));
+  let option = findScaleOption(value);
+  if (option) return option;
+  const [w, h] = streamDimensions(value);
+  option = document.createElement('option');
+  option.value = value.toFixed(6);
+  option.textContent = `${prefix}${w}×${h}`;
+  $('#selRes').appendChild(option);
+  return option;
+}
+function selectScale(scale) {
+  const option = findScaleOption(scale) || addScaleOption(scale);
+  $('#selRes').value = option.value;
+}
+function applyHostLimits(limits) {
+  if (!limits) return;
+  const maxFps = Number(limits.max_fps) || 240;
+  for (const option of $('#selFps').options) {
+    option.disabled = Number(option.value) > maxFps;
+    option.title = option.disabled ? `Лимит учётной записи: ${maxFps} FPS` : '';
+  }
+  $('#selFps').title = `Частота передачи кадров. Лимит учётной записи: ${maxFps} FPS`;
+}
+function setStreamStatus(state, pending=false) {
+  const badge = $('#streamStatus');
+  if (pending) {
+    badge.textContent = 'Применяю…'; badge.className = 'badge b-acc';
+    badge.title = 'Хост применяет параметры потока'; return;
+  }
+  if (!state || !state.applied) return;
+  const applied = state.applied;
+  const [w, h] = streamDimensions(applied.scale);
+  const reasons = state.reasons || [];
+  badge.textContent = `${w}×${h} · ${applied.fps} FPS · Q${applied.quality}`;
+  badge.className = `badge ${reasons.length ? 'b-warn' : 'b-ok'}`;
+  badge.title = reasons.length ? reasons.join('\n') : 'Хост подтвердил эти параметры';
+}
+function applyStreamState(state, announce) {
+  if (!state) return;
+  streamState = state;
+  applyHostLimits(state.limits);
+  const selected = state.selected || {};
+  if (selected.fps != null) ensureSelectValue($('#selFps'), selected.fps);
+  if (selected.quality != null) ensureSelectValue($('#selQ'), selected.quality, `Q${selected.quality}`);
+  if (selected.scale != null) selectScale(selected.scale);
+  if (selected.profile) $('#selProfile').value = selected.profile;
+  if (typeof selected.adaptive === 'boolean') {
+    $('#selAdaptive').value = selected.adaptive ? 'auto' : 'fixed';
+  }
+  setStreamStatus(state, false);
+  if (announce && state.reasons && state.reasons.length) hint(state.reasons.join('. '), 6000);
+  if (overlayOn) renderOverlay();
+}
 function buildResSelect() {
   const sel = $('#selRes');
   const [nw, nh] = nativeWH();
   sel.innerHTML = '';
   const add = (label, val) => {
+    if (findScaleOption(val)) return findScaleOption(val);
     const o = document.createElement('option');
-    o.textContent = label; o.value = val; sel.appendChild(o);
+    o.textContent = label; o.value = Number(val).toFixed(6); sel.appendChild(o);
+    return o;
   };
   add(`Родное хоста ${nw}×${nh}`, '1');
-  // Разрешение экрана самого клиента (MacBook) — в физических пикселях (Retina)
+  // Подбираем поток под физическую высоту экрана клиента, сохраняя пропорции хоста.
   const dpr = window.devicePixelRatio || 1;
-  const macW = Math.round(screen.width * dpr), macH = Math.round(screen.height * dpr);
-  if (macH && nh) {
-    const k = Math.max(0.25, Math.min(1, Math.round((macH / nh) * 100) / 100));
-    add(`Мой экран ${macW}×${macH}${macH >= nh ? ' · макс' : ''}`, String(k));
+  const clientH = Math.round(screen.height * dpr);
+  if (clientH && nh) {
+    const scale = Math.max(0.25, Math.min(1, clientH / nh));
+    const [w, h] = streamDimensions(scale);
+    add(`Под мой экран ${w}×${h}${scale >= 1 ? ' · макс' : ''}`, scale);
   }
   for (const [, h] of RES_LIST) {
     if (!nh || h >= nh) continue;
-    const k = Math.round((h / nh) * 100) / 100;
-    if (k < 0.25) continue;
-    add(`${Math.round(nw * (h / nh) / 2) * 2}×${h}`, String(k));
+    const scale = h / nh;
+    if (scale < 0.25) continue;
+    const [w, actualH] = streamDimensions(scale);
+    add(`${w}×${actualH}`, scale);
   }
   const want = P.get('scale') || 'auto';
   if (want === 'auto') {
     // дельта-кадры сильно снижают трафик, но полные кадры 1440p/4K всё ещё
     // тяжёлые — для плавности стартуем с 1080p
-    let v = '1';
+    let option = findScaleOption(1);
     if (nh > 1200) {
-      const o = [...sel.options].find(o => /×1080$/.test(o.textContent));
-      if (o) { v = o.value; hint('Разрешение потока: 1080p для плавности. Родное — в панели сверху.', 6000); }
+      const match = [...sel.options].find(item => /×1080(?:\D|$)/.test(item.textContent));
+      if (match) { option = match; hint('Разрешение потока: 1080p для плавности. Родное — в панели сверху.', 6000); }
     }
-    sel.value = v;
-  } else if ([...sel.options].some(o => o.value === want)) {
-    sel.value = want;
+    sel.value = option.value;
   } else {
-    add(`${Math.round(parseFloat(want) * 100)}%`, want);
-    sel.value = want;
+    selectScale(want);
   }
   sendConfig();
 }
@@ -508,6 +653,10 @@ function applyPermissions(next) {
   const hadInput = permissions.input;
   permissions = {...permissions, ...next};
   if (!hadInput && permissions.input) inputEnabled = true;
+  $('#btnClipS').style.display = permissions.clipboard ? '' : 'none';
+  $('#btnClipG').style.display = permissions.clipboard ? '' : 'none';
+  $('#btnFiles').style.display = permissions.files ? '' : 'none';
+  if (!permissions.files && $('#dlgFiles').open) $('#dlgFiles').close();
   updateInputButton();
   dirty = true;
 }
@@ -536,15 +685,30 @@ function updateInputButton() {
 
 function sendConfig() {
   if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({type:'config', fps:+$('#selFps').value, quality:+$('#selQ').value,
-    scale:+$('#selRes').value || 1, profile:$('#selProfile').value}));
+  const fps = Number($('#selFps').value), quality = Number($('#selQ').value);
+  const scale = Number($('#selRes').value);
+  if (!Number.isFinite(fps) || !Number.isFinite(quality) || !Number.isFinite(scale)) {
+    hint('Не удалось прочитать параметры потока', 4000); return;
+  }
+  const requestId = ++configSeq;
+  setStreamStatus(null, true);
+  ws.send(JSON.stringify({type:'config', request_id:requestId, fps, quality, scale,
+    profile:$('#selProfile').value, adaptive:$('#selAdaptive').value === 'auto'}));
+}
+function manualConfigChanged() {
+  $('#selProfile').value = 'custom';
+  sendConfig();
 }
 function applyProfile() {
-  const map = {office:[30,55], dev:[30,70], design:[60,85], video:[60,70],
-               game:[60,70], competitive:[120,40]};
+  const map = {office:[30,55,1], dev:[30,70,1], design:[60,80,1], video:[60,75,1],
+               game:[60,70,1], competitive:[120,60,0.75]};
   const p = $('#selProfile').value;
   const m = map[p];
-  if (m) { $('#selFps').value = m[0]; $('#selQ').value = m[1]; }
+  if (m) {
+    ensureSelectValue($('#selFps'), m[0]);
+    ensureSelectValue($('#selQ'), m[1], `Q${m[1]}`);
+    selectScale(m[2]);
+  }
   keyMode = (p === 'game' || p === 'competitive') ? 'game' : 'text';
   releaseAll(); updateKeysButton();
   sendConfig();
@@ -702,6 +866,105 @@ async function clipSend() {
     ws.send(JSON.stringify({type:'clipboard_set', text})); } catch(_){}
 }
 function clipGet() { ws.send(JSON.stringify({type:'clipboard_get'})); }
+
+const FILE_BASE = `http://${HOST}:${PORT}`;
+let fileLimits = null;
+function formatBytes(value) {
+  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let size = Math.max(0, Number(value) || 0), unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+  return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+async function fileApi(path, options={}) {
+  const headers = new Headers(options.headers || {});
+  headers.set('Authorization', 'Bearer ' + TOKEN);
+  const response = await fetch(FILE_BASE + path, {...options, headers});
+  if (!response.ok) throw new Error(await response.text());
+  return response;
+}
+function fileAction(text, className, handler) {
+  const button = document.createElement('button');
+  button.textContent = text;
+  button.className = className;
+  button.addEventListener('click', handler);
+  return button;
+}
+async function openFiles() {
+  if (!permissions.files) return;
+  exitCapture();
+  $('#dlgFiles').showModal();
+  await loadFiles();
+}
+async function loadFiles() {
+  const state = $('#fileState');
+  state.textContent = 'Загрузка…';
+  try {
+    const data = await (await fileApi('/api/files')).json();
+    fileLimits = data;
+    $('#fileUsage').textContent = `${formatBytes(data.used)} из ${formatBytes(data.quota)}`;
+    const body = $('#fileTable tbody');
+    body.replaceChildren();
+    for (const file of data.files) {
+      const row = document.createElement('tr');
+      const name = document.createElement('td'); name.textContent = file.name;
+      const size = document.createElement('td'); size.textContent = formatBytes(file.size);
+      const modified = document.createElement('td');
+      modified.textContent = new Date(file.modified * 1000).toLocaleString();
+      const actions = document.createElement('td');
+      actions.append(fileAction('Скачать', '', () => downloadFile(file.name)),
+                     fileAction('Удалить', 'danger', () => deleteFile(file.name)));
+      row.append(name, size, modified, actions);
+      body.appendChild(row);
+    }
+    state.textContent = data.files.length ? '' : 'Файлов пока нет';
+  } catch (error) {
+    state.textContent = error.message;
+  }
+}
+async function uploadFile() {
+  const file = $('#fileInput').files[0], state = $('#fileState'), button = $('#btnUpload');
+  if (!file) { state.textContent = 'Выберите файл'; return; }
+  if (fileLimits && file.size > fileLimits.max_upload) {
+    state.textContent = `Файл больше лимита ${formatBytes(fileLimits.max_upload)}`;
+    return;
+  }
+  const form = new FormData(); form.append('file', file, file.name);
+  button.disabled = true; state.textContent = `Загрузка ${file.name}…`;
+  try {
+    await fileApi('/api/files/upload', {method:'POST', body:form});
+    $('#fileInput').value = '';
+    await loadFiles();
+  } catch (error) {
+    state.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+async function downloadFile(name) {
+  const state = $('#fileState');
+  try {
+    state.textContent = `Скачивание ${name}…`;
+    const blob = await (await fileApi('/api/files/download/' + encodeURIComponent(name))).blob();
+    const url = URL.createObjectURL(blob), link = document.createElement('a');
+    link.href = url; link.download = name; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    state.textContent = '';
+  } catch (error) {
+    state.textContent = error.message;
+  }
+}
+async function deleteFile(name) {
+  if (!confirm(`Удалить «${name}»?`)) return;
+  const state = $('#fileState');
+  try {
+    await fileApi('/api/files/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name})});
+    await loadFiles();
+  } catch (error) {
+    state.textContent = error.message;
+  }
+}
+$('#dlgFiles').addEventListener('close', () => cv.focus());
 
 connect();
 </script>

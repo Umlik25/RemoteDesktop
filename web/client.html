@@ -49,7 +49,7 @@
     (панель хоста → Пользователи → «Код сброса»). Введите его и задайте новый пароль —
     остальные данные и активные сессии не пострадают.</p>
     <label class="f">Код сброса<input id="cResetCode"></label>
-    <label class="f">Новый пароль (мин. 4 символа)<input id="cResetPass" type="password"></label>
+    <label class="f">Новый пароль (мин. 8 символов)<input id="cResetPass" type="password" minlength="8"></label>
     <div class="row"><button onclick="doReset()">Сменить пароль</button></div>
     <hr style="border-color:var(--line)">
   </div>
@@ -66,8 +66,13 @@
     <option value="custom">Пользовательский</option>
   </select></label>
   <div class="row">
-    <label class="f" style="flex:1">FPS<select id="cFps"><option>30</option><option selected>60</option><option>90</option><option>120</option><option>144</option></select></label>
-    <label class="f" style="flex:1">Качество<select id="cQ"><option value="50">Низкое</option><option value="70" selected>Среднее</option><option value="85">Высокое</option></select></label>
+    <label class="f" style="flex:1">FPS<select id="cFps"><option>15</option><option selected>30</option><option>60</option><option>90</option><option>120</option><option>144</option></select></label>
+    <label class="f" style="flex:1">Качество<select id="cQ">
+      <option value="40">Экономное (Q40)</option><option value="55">Офис (Q55)</option>
+      <option value="60">Плавность (Q60)</option><option value="70" selected>Чёткое (Q70)</option>
+      <option value="75">Видео (Q75)</option><option value="80">Высокое (Q80)</option>
+      <option value="85">Очень высокое (Q85)</option><option value="95">Максимум (Q95)</option>
+    </select></label>
     <label class="f" style="flex:1">Разрешение<select id="cScale"><option value="auto" selected>Авто (рекоменд.)</option><option value="1">Родное (100%)</option><option value="0.75">75%</option><option value="0.5">50%</option></select></label>
   </div>
   <p class="muted">Фактические FPS и качество зависят от сети, кодирования на хосте и возможностей этого устройства. 90–144 FPS требуют быстрой LAN.</p>
@@ -80,6 +85,9 @@
 
 <script>
 const $ = s => document.querySelector(s);
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+})[ch]);
 let hosts = [], current = null, mode = 'login';
 
 function swMode(m) {
@@ -121,18 +129,23 @@ async function loadHosts() {
     if (h.gpu && !/uhd|iris|basic/i.test(h.gpu)) scen.push('игры*');
     div.innerHTML = `
       <div class="row" style="justify-content:space-between">
-        <h2 style="margin:0">${h.name}</h2>
+        <h2 style="margin:0">${esc(h.name)}</h2>
         <span class="badge ${h.accepting?'b-ok':'b-err'}">${h.accepting?'доступен':'закрыт'}</span>
       </div>
       <div class="kv" style="margin:8px 0">
-        <b>Адрес</b><span>${h.ip}:${h.port} ${h.manual?'(вручную)':'<span class="badge b-ok">LAN Direct</span>'}</span>
-        <b>CPU</b><span>${h.cpu||'—'} (${h.cores||'?'}я/${h.threads||'?'}п)</span>
-        <b>RAM</b><span>${h.ram_gb||'—'} ГБ</span>
-        <b>GPU</b><span>${h.gpu||'—'}</span>
-        <b>Сессий</b><span>${h.sessions ?? 0}</span>
-        <b>Сценарии</b><span>${scen.join(' / ')||'—'} <span class="muted">${scen.includes('игры*')?'(*зависит от GPU и сети)':''}</span></span>
+        <b>Адрес</b><span>${esc(h.ip)}:${esc(h.port)} ${h.manual?'(вручную)':'<span class="badge b-ok">LAN Direct</span>'}</span>
+        <b>CPU</b><span>${esc(h.cpu||'—')} (${esc(h.cores||'?')}я/${esc(h.threads||'?')}п)</span>
+        <b>RAM</b><span>${esc(h.ram_gb||'—')} ГБ</span>
+        <b>GPU</b><span>${esc(h.gpu||'—')}</span>
+        <b>Сессий</b><span>${esc(h.sessions ?? 0)}</span>
+        <b>Сценарии</b><span>${esc(scen.join(' / ')||'—')} <span class="muted">${scen.includes('игры*')?'(*зависит от GPU и сети)':''}</span></span>
       </div>
-      <button ${h.accepting?'':'disabled'} onclick="openConnect('${h.ip}', ${h.port}, '${(h.name||'').replace(/'/g,'')}')">Подключиться</button>`;
+      <div class="connect-slot"></div>`;
+    const button = document.createElement('button');
+    button.textContent = 'Подключиться';
+    button.disabled = !h.accepting;
+    button.addEventListener('click', () => openConnect(h.ip, h.port, h.name || h.ip));
+    div.querySelector('.connect-slot').appendChild(button);
     box.appendChild(div);
   }
 }
@@ -154,9 +167,9 @@ async function openConnect(ip, port, name) {
     const info = await (await fetch(`http://${ip}:${port}/api/info`)).json();
     const enc = info.encoders||{};
     $('#dcInfo').innerHTML = `
-      <b>ОС</b><span>${info.os||'—'}</span>
-      <b>GPU</b><span>${(info.gpus||[]).map(g=>g.name).join(', ')||'—'}</span>
-      <b>Аппаратные кодеки</b><span>${(enc.apis||[]).join(', ')||'нет'} ${enc.av1?'· AV1':''}</span>
+      <b>ОС</b><span>${esc(info.os||'—')}</span>
+      <b>GPU</b><span>${esc((info.gpus||[]).map(g=>g.name).join(', ')||'—')}</span>
+      <b>Аппаратные кодеки</b><span>${esc((enc.apis||[]).join(', ')||'нет')} ${enc.av1?'· AV1':''}</span>
       <b>Кодек потока</b><span>MJPEG (MVP)</span>`;
   } catch(e) { $('#dcInfo').innerHTML = '<b>Статус</b><span style="color:var(--err)">Хост недоступен по HTTP</span>'; }
   dlgConnect.showModal();
@@ -164,10 +177,13 @@ async function openConnect(ip, port, name) {
 
 $('#cProfile').onchange = () => {
   const p = $('#cProfile').value;
-  const map = {office:[30,50,1], dev:[30,70,1], design:[60,85,1], video:[60,70,1],
-               game:[60,70,1], competitive:[120,50,0.75]};
+  const map = {office:[30,55,1], dev:[30,70,1], design:[60,80,1], video:[60,75,1],
+               game:[60,70,1], competitive:[120,60,0.75]};
   if (map[p]) { $('#cFps').value = map[p][0]; $('#cQ').value = map[p][1]; $('#cScale').value = map[p][2]; }
 };
+for (const id of ['#cFps', '#cQ', '#cScale']) {
+  $(id).addEventListener('change', () => { $('#cProfile').value = 'custom'; });
+}
 
 async function doConnect() {
   const {ip, port} = current;
@@ -182,10 +198,10 @@ async function doConnect() {
       body: JSON.stringify({username: $('#cUser').value.trim(), password: $('#cPass').value})});
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
-    const q = new URLSearchParams({host: ip, port, token: d.token,
+    const q = new URLSearchParams({host: ip, port,
       fps: $('#cFps').value, quality: $('#cQ').value, scale: $('#cScale').value,
-      profile: $('#cProfile').value, name: current.name});
-    window.open('/viewer?' + q, '_blank');
+      profile: $('#cProfile').value, adaptive: '1', name: current.name});
+    window.open('/viewer?' + q + '#token=' + encodeURIComponent(d.token), '_blank');
     dlgConnect.close();
   } catch(e) { $('#cErr').textContent = e.message; }
 }

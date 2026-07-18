@@ -279,8 +279,8 @@ UI показывает фактическую доступность каждо
 
 | Этап | Содержимое |
 |---|---|
-| **0.1 (поставлен)** | Роли host/client, LAN discovery, логин/пароль+приглашения, MJPEG-стриминг, ввод, буфер обмена, панель хоста (пользователи/сессии/журналы/настройки), Capability Report, Capacity Planner, оверлей, governor деградации, резерв владельца |
-| 0.2 | TLS (self-signed + pinning), звук (Opus), передача файлов с разрешением, геймпад (ViGEm/uinput) |
+| **0.1 (поставлен)** | Роли host/client, LAN discovery, логин/пароль+приглашения, защищённая панель owner/admin, MJPEG-стриминг, ввод, буфер обмена, изолированный обмен файлами с квотами, панель хоста (пользователи/сессии/журналы/настройки), Capability Report, Capacity Planner, оверлей, governor деградации, резерв владельца |
+| 0.2 | TLS (self-signed + pinning), звук (Opus), геймпад (ViGEm/uinput) |
 | 0.3 | Нативное ядро захвата/кодирования: DXGI+NVENC/AMF/QSV → H.264/HEVC, UDP-транспорт с FEC, полноценный подсчёт задержек по стадиям |
 | 0.4 | Control plane (аккаунты, 2FA, устройства, approve), NAT traversal (STUN/hole punching), relay-fallback, Internet Direct |
 | 0.5 | Linux-хост: множественные изолированные сессии (headless Wayland + cgroups), квоты ресурсов |

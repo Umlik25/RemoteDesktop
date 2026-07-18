@@ -1,6 +1,7 @@
 """Общее состояние приложения: конфиг, журнал аудита, пути к данным."""
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -29,6 +30,10 @@ DEFAULT_CONFIG = {
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        os.chmod(DATA_DIR, 0o700)
+    except OSError:
+        pass
 
 
 def load_config():
@@ -45,8 +50,22 @@ def load_config():
 def save_config(cfg):
     ensure_data_dir()
     with _lock:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        fd, tmp_path = tempfile.mkstemp(prefix=".config_", suffix=".tmp", dir=DATA_DIR)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, CONFIG_PATH)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
 
 def audit(action, actor="system", details=None):

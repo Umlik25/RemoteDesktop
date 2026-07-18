@@ -4,6 +4,7 @@
 напрямую по WebSocket (LAN Direct) — трафик не ходит через третьи узлы.
 """
 import asyncio
+import ipaddress
 import json
 import socket
 import time
@@ -51,10 +52,22 @@ async def _discovery_listener(port):
             continue
         if d.get("app") != "App_Remote" or d.get("role") != "host":
             continue
-        key = f"{addr[0]}:{d.get('port')}"
-        d["ip"] = addr[0]
-        d["last_seen"] = time.time()
-        _hosts[key] = d
+        try:
+            port = int(d.get("port"))
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except (TypeError, ValueError):
+            continue
+        clean = {
+            "app": "App_Remote", "role": "host", "ip": addr[0], "port": port,
+            "name": str(d.get("name") or addr[0])[:64],
+            "cpu": str(d.get("cpu") or "")[:200],
+            "gpu": str(d.get("gpu") or "")[:200],
+            "cores": d.get("cores"), "threads": d.get("threads"),
+            "ram_gb": d.get("ram_gb"), "sessions": d.get("sessions"),
+            "accepting": bool(d.get("accepting", True)), "last_seen": time.time(),
+        }
+        _hosts[f"{addr[0]}:{port}"] = clean
 
 
 async def page_client(request):
@@ -69,20 +82,28 @@ async def api_hosts(request):
     now = time.time()
     out = []
     for key, h in list(_hosts.items()):
-        if now - h["last_seen"] > 15:
+        if not h.get("manual") and now - h["last_seen"] > 15:
             _hosts.pop(key, None)
             continue
-        out.append({**h, "age_s": round(now - h["last_seen"], 1)})
+        out.append({**h, "age_s": 0 if h.get("manual") else round(now - h["last_seen"], 1)})
     return web.json_response(out)
 
 
 async def api_add_host(request):
     """Ручное добавление хоста по ip:port (для сетей без broadcast)."""
     d = await request.json()
-    ip, port = d["ip"], int(d.get("port", 8532))
+    try:
+        ip = str(ipaddress.ip_address(str(d["ip"]).strip()))
+        if ":" in ip:
+            raise ValueError("IPv6 пока не поддерживается веб-клиентом")
+        port = int(d.get("port", 8532))
+        if not 1 <= port <= 65535:
+            raise ValueError("Недопустимый порт")
+    except (KeyError, TypeError, ValueError) as e:
+        raise web.HTTPBadRequest(text=str(e) or "Введите корректный IPv4-адрес и порт")
     _hosts[f"{ip}:{port}"] = {"app": "App_Remote", "role": "host", "name": d.get("name", ip),
                               "ip": ip, "port": port, "manual": True,
-                              "accepting": True, "last_seen": time.time() + 1e9}
+                              "accepting": True, "last_seen": time.time()}
     return web.json_response({"ok": True})
 
 
