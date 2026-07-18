@@ -209,6 +209,9 @@ async function onText(d) {
     cv.focus();
     pokeToolbar();
     renderOverlay();
+    if (captureMode && permissions.input) {
+      hint('Кликните по экрану — мышь захватится (полный экран). Выход: удерживайте Esc.', 6000);
+    }
   } else if (d.type === 'pong') {
     const rtt = performance.now() - d.t;
     rtts.push(rtt); if (rtts.length > 20) rtts.shift();
@@ -318,19 +321,38 @@ function toggleInput() {
   updateCursorMode();
 }
 function toggleFs() {
-  if (document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  if (document.fullscreenElement) exitCapture();
+  else if (captureMode && permissions.input && inputEnabled) enterCapture();
   else document.documentElement.requestFullscreen().catch(()=>{});
 }
-// полноэкранный режим сбрасывает Pointer Lock — возвращаем захват сами,
-// иначе курсор снова дотягивается до меню/дока macOS
-document.addEventListener('fullscreenchange', () => {
-  if (document.fullscreenElement && captureMode && permissions.input && inputEnabled) {
-    setTimeout(enterCapture, 60);
-  }
-});
 function disconnect() { exitCapture(); if (ws) ws.close(); showMsg('Отключено', 'Можно закрыть вкладку'); }
 
-// -------- захват мыши (Pointer Lock): курсор не задевает меню/док Mac --------
+// -------- захват мыши --------
+// Захват = полный экран + Pointer Lock + Keyboard Lock. Полный экран нужен,
+// чтобы Keyboard Lock отдавал Esc НА ХОСТ (а не сбрасывал захват) — это и есть
+// тот приём, которым решают проблему браузерные клиенты облачного гейминга.
+// Тап по Esc уходит в Windows; чтобы выйти — УДЕРЖИТЕ Esc (браузер сам выйдет
+// из полноэкранного режима) или кнопкой «Захват». Где Keyboard Lock не
+// поддерживается (Safari) — Esc всё равно уходит на хост, а захват сам
+// возвращается следующим кликом.
+let kbLocked = false, kbSupported = !!(navigator.keyboard && navigator.keyboard.lock);
+function kbLock() {
+  if (kbLocked || !kbSupported) return;
+  try { navigator.keyboard.lock(['Escape']); kbLocked = true; } catch(_) {}
+}
+function kbUnlock() {
+  if (kbLocked) { try { navigator.keyboard.unlock(); } catch(_) {} }
+  kbLocked = false;
+}
+function requestPL() {
+  if (document.pointerLockElement === cv) return;
+  const [nw, nh] = nativeWH();
+  vx = clamp(hostCursorPos.x / nw); vy = clamp(hostCursorPos.y / nh);  // старт без скачка
+  try {
+    const p = cv.requestPointerLock({unadjustedMovement: true});   // без ускорения ОС
+    if (p && p.catch) p.catch(() => { try { cv.requestPointerLock(); } catch(_){} });
+  } catch(_) { try { cv.requestPointerLock(); } catch(_){} }
+}
 function toggleCaptureMode() {
   captureMode = !captureMode;
   updateCaptureButton();
@@ -339,30 +361,42 @@ function toggleCaptureMode() {
 }
 function enterCapture() {
   if (!permissions.input || !inputEnabled || !cv.requestPointerLock) return;
-  // стартуем с фактической позиции курсора хоста — без скачка
-  const [nw, nh] = nativeWH();
-  vx = clamp(hostCursorPos.x / nw); vy = clamp(hostCursorPos.y / nh);
-  try {
-    const p = cv.requestPointerLock({unadjustedMovement: true});  // без ускорения ОС
-    if (p && p.catch) p.catch(() => { try { cv.requestPointerLock(); } catch(_){} });
-  } catch(_) { try { cv.requestPointerLock(); } catch(_){} }
+  captureMode = true; updateCaptureButton();
+  if (!document.fullscreenElement) {
+    // после входа в полный экран fullscreenchange сам возьмёт keyboard+pointer lock
+    document.documentElement.requestFullscreen().catch(() => requestPL());
+  } else {
+    kbLock(); requestPL();
+  }
 }
 function exitCapture() {
+  kbUnlock();
   if (document.pointerLockElement === cv && document.exitPointerLock) document.exitPointerLock();
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(()=>{});
 }
+document.addEventListener('fullscreenchange', () => {
+  if (document.fullscreenElement) {
+    if (captureMode && permissions.input && inputEnabled) { kbLock(); setTimeout(requestPL, 40); }
+  } else {
+    // вышли из полного экрана (удержание Esc / ⛶) — полностью снимаем захват
+    kbUnlock();
+    if (document.pointerLockElement === cv) document.exitPointerLock();
+  }
+});
 document.addEventListener('pointerlockchange', () => {
   captured = document.pointerLockElement === cv;
   if (captured) {
     releaseAll();
     toolbar.classList.add('hidden');
-    hint('Мышь захвачена · Esc — освободить курсор', 3000);
+    hint(kbLocked ? 'Захвачено · Esc уходит в Windows · удерживайте Esc для выхода'
+                  : 'Захвачено · Esc уходит в Windows · кнопка «Захват» — выход', 3500);
   } else {
-    releaseAll(); hint(''); pokeToolbar();
+    releaseAll(); pokeToolbar();
   }
   updateCursorMode();
 });
 document.addEventListener('pointerlockerror', () => {
-  // браузер не дал захват — не «съедаем» клики, работаем в оконном режиме
+  // не удалось захватить — не «съедаем» клики, работаем в оконном режиме
   captureMode = false; captured = false;
   updateCaptureButton(); updateCursorMode();
   hint('Захват мыши недоступен в этом браузере — оконный режим', 4000);
@@ -598,7 +632,8 @@ function isChord(e) {
 }
 cv.addEventListener('keydown', e => {
   if (!inputEnabled) return;
-  if (captured && e.key === 'Escape') return;   // Esc освобождает курсор
+  // Esc НЕ гасим — он уходит на хост (в Windows). Выход из захвата —
+  // удержанием Esc (Keyboard Lock сам выйдет из полного экрана) или кнопкой.
   e.preventDefault();
   const single = e.key.length === 1;
   if (single && !isChord(e) && keyMode === 'text') {
@@ -620,7 +655,6 @@ cv.addEventListener('keydown', e => {
 });
 cv.addEventListener('keyup', e => {
   if (!inputEnabled) return;
-  if (captured && e.key === 'Escape') return;
   e.preventDefault();
   const single = e.key.length === 1;
   const k = single ? (physicalChar(e) || e.key) : mapKeyName(e);

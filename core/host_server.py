@@ -92,6 +92,39 @@ if _user32 is not None:
     except Exception:
         _GetCursorInfo = None
 
+# Точная инъекция мыши через SendInput (как в проф. remote-решениях): абсолютное
+# позиционирование в нормированных координатах 0..65535 не зависит от DPI-мас-
+# штабирования, корректно работает с боковыми кнопками и горизонтальным колесом,
+# и надёжнее SetCursorPos. При любой осечке — откат на pynput.
+_SENDINPUT_OK = False
+if _user32 is not None:
+    try:
+        class _MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                        ("mouseData", ctypes.c_uint32), ("dwFlags", ctypes.c_uint32),
+                        ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t)]
+
+        class _INPUTUNION(ctypes.Union):
+            _fields_ = [("mi", _MOUSEINPUT)]
+
+        class _INPUT(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_uint32), ("u", _INPUTUNION)]
+
+        _user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
+        _user32.SendInput.restype = ctypes.c_uint
+        _MEF = {"move": 0x0001, "abs": 0x8000, "ldown": 0x0002, "lup": 0x0004,
+                "rdown": 0x0008, "rup": 0x0010, "mdown": 0x0020, "mup": 0x0040,
+                "xdown": 0x0080, "xup": 0x0100, "wheel": 0x0800, "hwheel": 0x1000}
+        _SENDINPUT_OK = True
+
+        def _send_mouse(flags, dx=0, dy=0, data=0):
+            inp = _INPUT()
+            inp.type = 0  # INPUT_MOUSE
+            inp.u.mi = _MOUSEINPUT(dx, dy, data & 0xffffffff, flags, 0, 0)
+            return _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+    except Exception:
+        _SENDINPUT_OK = False
+
 try:
     from pynput.mouse import Controller as MouseController, Button
     from pynput.keyboard import Controller as KeyController, Key, KeyCode
@@ -283,24 +316,55 @@ class InputInjector:
         self.kb = KeyController() if INPUT_OK else None
         self.screen_wh = None
 
+    def _mouse_move(self, nx, ny):
+        """nx,ny в 0..1. SendInput (абсолют, 0..65535) — если доступен; иначе pynput."""
+        if _SENDINPUT_OK and _send_mouse(_MEF["move"] | _MEF["abs"],
+                                         int(nx * 65535), int(ny * 65535)):
+            return
+        if self.screen_wh:
+            x = int(nx * (self.screen_wh[0] - 1))
+            y = int(ny * (self.screen_wh[1] - 1))
+            self.mouse.position = (x, y)
+
+    def _mouse_button(self, b, down):
+        if _SENDINPUT_OK:
+            pairs = {0: ("ldown", "lup"), 1: ("mdown", "mup"), 2: ("rdown", "rup")}
+            if b in pairs:
+                if _send_mouse(_MEF[pairs[b][0 if down else 1]]):
+                    return
+            elif b in (3, 4):  # боковые кнопки: XBUTTON1/2 в mouseData
+                if _send_mouse(_MEF["xdown" if down else "xup"], data=(b - 2)):
+                    return
+        btn = BTN_MAP.get(b)
+        if btn is not None:
+            (self.mouse.press if down else self.mouse.release)(btn)
+
+    def _mouse_wheel(self, dx, dy):
+        # dx,dy — «щелчки» (клиент шлёт кратно 100). WHEEL_DELTA = 120 на щелчок.
+        if _SENDINPUT_OK:
+            done = True
+            if dy:
+                done &= bool(_send_mouse(_MEF["wheel"], data=(dy * 120) & 0xffffffff))
+            if dx:
+                done &= bool(_send_mouse(_MEF["hwheel"], data=(dx * 120) & 0xffffffff))
+            if done:
+                return
+        if dx or dy:
+            self.mouse.scroll(dx, dy)
+
     def apply(self, ev):
         if not INPUT_OK:
             return
         t = ev.get("t")
         try:
-            if t == "mm" and self.screen_wh:
-                x = int(max(0, min(1, float(ev["x"]))) * (self.screen_wh[0] - 1))
-                y = int(max(0, min(1, float(ev["y"]))) * (self.screen_wh[1] - 1))
-                self.mouse.position = (x, y)
+            if t == "mm":
+                self._mouse_move(max(0.0, min(1.0, float(ev["x"]))),
+                                 max(0.0, min(1.0, float(ev["y"]))))
             elif t == "mb":
-                btn = BTN_MAP.get(ev.get("b", 0))
-                if btn is not None:
-                    (self.mouse.press if ev.get("d") else self.mouse.release)(btn)
+                self._mouse_button(ev.get("b", 0), bool(ev.get("d")))
             elif t == "wh":
-                dy = int(-float(ev.get("dy", 0)) / 100)
-                dx = int(float(ev.get("dx", 0)) / 100)
-                if dx or dy:
-                    self.mouse.scroll(dx, dy)
+                self._mouse_wheel(int(float(ev.get("dx", 0)) / 100),
+                                  int(-float(ev.get("dy", 0)) / 100))
             elif t == "kb":
                 key = ev.get("k", "")
                 k = KEY_MAP.get(key)
