@@ -63,6 +63,16 @@ class AuthSecurityTests(unittest.IsolatedAsyncioTestCase):
         invite = next(item for item in auth.list_invites() if item["code"] == code)
         self.assertFalse(invite["used"])
 
+    def test_display_permission_survives_invite_redemption(self):
+        code = auth.create_invite(allow_display=True)
+
+        auth.redeem_invite(code, "display-user", "long-enough-password")
+
+        self.assertTrue(auth.get_user("display-user")["allow_display"])
+        listed = next(item for item in auth.list_users()
+                      if item["username"] == "display-user")
+        self.assertTrue(listed["allow_display"])
+
     def test_failed_password_reset_does_not_consume_code(self):
         auth.create_user("user", "long-enough-password")
         code = auth.create_reset_code("user")

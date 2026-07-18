@@ -21,6 +21,7 @@ IS_MAC = sys.platform == "darwin"
 _static_cache = None
 _bench_cache = None
 _net_prev = None  # (ts, bytes_sent, bytes_recv) для расчёта скорости
+_gpu_load_cache = (0.0, None)
 
 
 def _run(cmd, timeout=10):
@@ -230,7 +231,7 @@ def get_static_info():
 
 
 def get_load():
-    global _net_prev
+    global _net_prev, _gpu_load_cache
     cpu = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory()
     now = time.time()
@@ -261,7 +262,13 @@ def get_load():
         "gpu_temp": None, "gpu_power_w": None,
         "encoder_percent": None,
     }
-    smi = _nvidia_smi("utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,utilization.encoder")
+    # Запуск nvidia-smi может занимать сотни миллисекунд и сам создавать
+    # микрофризы. Метрики GPU не требуют частоты видеопотока, кэшируем их.
+    smi_ts, smi = _gpu_load_cache
+    mono = time.monotonic()
+    if mono - smi_ts >= 5.0:
+        smi = _nvidia_smi("utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,utilization.encoder")
+        _gpu_load_cache = (mono, smi)
     if smi:
         try:
             parts = [p.strip() for p in smi.splitlines()[0].split(",")]

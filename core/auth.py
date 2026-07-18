@@ -114,6 +114,7 @@ def list_users():
             "allow_input": u.get("allow_input", True),
             "allow_clipboard": u.get("allow_clipboard", False),
             "allow_files": u.get("allow_files", False),
+            "allow_display": u.get("allow_display", False),
             "expires": u.get("expires"),
             "priority": u.get("priority", "normal"),
             "max_fps": u.get("max_fps", 60),
@@ -125,6 +126,7 @@ def list_users():
 
 def create_user(username, password, role="user", profile="office", *, priority="normal",
                 allow_input=True, allow_clipboard=False, allow_files=False,
+                allow_display=False,
                 max_fps=60, disk_quota_mb=2048, expires=None, actor="system"):
     username = _validate_username(username)
     _validate_password(password)
@@ -144,7 +146,8 @@ def create_user(username, password, role="user", profile="office", *, priority="
             "salt": salt, "pw": _hash_pw(password, salt), "role": role,
             "profile": profile, "priority": priority,
             "allow_input": allow_input, "allow_clipboard": allow_clipboard,
-            "allow_files": allow_files, "max_fps": max_fps,
+            "allow_files": allow_files, "allow_display": allow_display,
+            "max_fps": max_fps,
             "disk_quota_mb": disk_quota_mb,
             "blocked": False, "expires": expires,
             "storage_id": secrets.token_hex(12),
@@ -156,7 +159,8 @@ def create_user(username, password, role="user", profile="office", *, priority="
 
 def update_user(username, fields, actor="system"):
     allowed = {"role", "profile", "priority", "allow_input", "allow_clipboard",
-               "allow_files", "max_fps", "disk_quota_mb", "blocked", "expires"}
+               "allow_files", "allow_display", "max_fps", "disk_quota_mb",
+               "blocked", "expires"}
     username = _clean_username(username)
     if not isinstance(fields, dict):
         raise ValueError("Параметры пользователя должны быть объектом")
@@ -181,7 +185,7 @@ def update_user(username, fields, actor="system"):
             raise ValueError("Квота файлов должна быть числом") from None
         if not 16 <= fields["disk_quota_mb"] <= 102_400:
             raise ValueError("Квота файлов должна быть от 16 до 102400 МБ")
-    for key in ("allow_input", "allow_clipboard", "allow_files", "blocked"):
+    for key in ("allow_input", "allow_clipboard", "allow_files", "allow_display", "blocked"):
         if key in fields and not isinstance(fields[key], bool):
             raise ValueError(f"Поле {key} должно быть логическим")
     if "expires" in fields and fields["expires"] is not None:
@@ -284,6 +288,7 @@ def revoke_user_tokens(username):
 
 def create_invite(role="guest", profile="office", ttl_hours=24, priority="low",
                   allow_input=True, allow_clipboard=False, allow_files=False,
+                  allow_display=False,
                   session_hours=None, disk_quota_mb=512, actor="system"):
     _validate_policy(role, profile, priority, 60)
     ttl_hours = float(ttl_hours)
@@ -304,7 +309,7 @@ def create_invite(role="guest", profile="office", ttl_hours=24, priority="low",
         inv[code] = {
             "role": role, "profile": profile, "priority": priority,
             "allow_input": allow_input, "allow_clipboard": allow_clipboard,
-            "allow_files": allow_files,
+            "allow_files": allow_files, "allow_display": allow_display,
             "disk_quota_mb": disk_quota_mb,
             "expires_at": time.time() + ttl_hours * 3600,
             "session_hours": session_hours,
@@ -384,6 +389,7 @@ def redeem_invite(code, username, password):
                     allow_input=rec.get("allow_input", True),
                     allow_clipboard=rec.get("allow_clipboard", False),
                     allow_files=rec.get("allow_files", False),
+                    allow_display=rec.get("allow_display", False),
                     disk_quota_mb=rec.get("disk_quota_mb", 512),
                     expires=expires, actor=f"invite:{code}")
         rec["used"] = True

@@ -209,11 +209,11 @@ Session {
   load_profile: office|dev|design|video|game|competitive|custom,
   resources: {cpu, ram, gpu_mode, vram, disk_quota, net_priority,
               max_resolution, max_fps, max_bitrate, priority},
-  permissions: {input, mic, clipboard, files, devices[]},
+  permissions: {input, mic, clipboard, files, display, devices[]},
   expires_at, storage_ref, history[]
 }
 ```
-MVP хранит подмножество (профиль, приоритет, права ввода/буфера, срок доступа,
+MVP хранит подмножество (профиль, приоритет, права ввода/буфера/файлов/дисплея, срок доступа,
 историю) — расширение до VM-типов не меняет API.
 
 ### 9.2 Владелец — привилегированная сессия

@@ -102,7 +102,7 @@
         </div>
         <table id="usersTable">
           <thead><tr><th>Имя</th><th>Роль</th><th>Профиль</th><th>Приоритет</th><th>Ввод</th><th>Буфер</th>
-          <th>Файлы</th><th>Квота</th><th>Макс. FPS</th><th>Статус</th><th></th></tr></thead>
+          <th>Файлы</th><th>Дисплей</th><th>Квота</th><th>Макс. FPS</th><th>Статус</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -123,11 +123,12 @@
           <label class="f" style="margin:0"><input type="checkbox" id="invInput" checked style="width:auto"> Ввод</label>
           <label class="f" style="margin:0"><input type="checkbox" id="invClip" style="width:auto"> Буфер</label>
           <label class="f" style="margin:0"><input type="checkbox" id="invFiles" style="width:auto"> Файлы</label>
+          <label class="f" style="margin:0"><input type="checkbox" id="invDisplay" style="width:auto"> Дисплей</label>
           <select id="invQuota"><option value="512">Файлы: 512 МБ</option><option value="2048">2 ГБ</option><option value="10240">10 ГБ</option></select>
           <button onclick="createInvite()">Создать одноразовый код</button>
         </div>
         <p class="muted">Приглашённый вводит код и придумывает себе логин/пароль на экране подключения клиента. Код одноразовый и отзывается мгновенно.</p>
-        <table id="invTable"><thead><tr><th>Код</th><th>Роль</th><th>Профиль</th><th>Ввод</th><th>Файлы</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table>
+        <table id="invTable"><thead><tr><th>Код</th><th>Роль</th><th>Профиль</th><th>Ввод</th><th>Файлы</th><th>Дисплей</th><th>Создан</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table>
       </div>
     </div>
 
@@ -179,6 +180,7 @@
   <label class="f"><input type="checkbox" id="nuInput" checked style="width:auto"> Разрешить клавиатуру/мышь</label>
   <label class="f"><input type="checkbox" id="nuClip" style="width:auto"> Разрешить буфер обмена</label>
   <label class="f"><input type="checkbox" id="nuFiles" style="width:auto"> Разрешить передачу файлов</label>
+  <label class="f"><input type="checkbox" id="nuDisplay" style="width:auto"> Разрешить менять общий дисплей Windows</label>
   <div class="row"><button onclick="createUser()">Создать</button>
   <button class="sec" onclick="dlgUser.close()">Отмена</button></div>
   <p id="nuErr" class="muted" style="color:var(--err)"></p>
@@ -347,7 +349,7 @@ async function loadUsers() {
   for (const u of users) {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${esc(u.username)}</td><td>${esc(u.role)}</td><td>${esc(u.profile)}</td><td>${esc(u.priority)}</td>
-      <td>${u.allow_input?'✓':'—'}</td><td>${u.allow_clipboard?'✓':'—'}</td><td>${u.allow_files?'✓':'—'}</td>
+      <td>${u.allow_input?'✓':'—'}</td><td>${u.allow_clipboard?'✓':'—'}</td><td>${u.allow_files?'✓':'—'}</td><td>${u.allow_display?'✓':'—'}</td>
       <td>${esc(u.disk_quota_mb)} МБ</td><td>${esc(u.max_fps)}</td>
       <td>${u.blocked?'<span class="badge b-err">заблокирован</span>':'<span class="badge b-ok">активен</span>'}</td>
       <td class="row"></td>`;
@@ -358,6 +360,9 @@ async function loadUsers() {
       'sec small', () => setUserField(u.username, {allow_clipboard: !u.allow_clipboard})));
     actions.appendChild(actionButton(u.allow_files ? 'Запретить файлы' : 'Разрешить файлы',
       'sec small', () => setUserField(u.username, {allow_files: !u.allow_files})));
+    actions.appendChild(actionButton(u.allow_display ? 'Запретить дисплей' : 'Разрешить дисплей',
+      'sec small', () => setUserField(u.username, {allow_display: !u.allow_display}),
+      'Разрешает менять системное разрешение общего рабочего стола Windows'));
     actions.appendChild(actionButton('Квота', 'sec small', () => setUserQuota(u.username, u.disk_quota_mb)));
     actions.appendChild(actionButton('Сбросить пароль', 'sec small', () => resetPw(u.username)));
     actions.appendChild(actionButton('Код сброса', 'sec small', () => resetCode(u.username),
@@ -376,7 +381,8 @@ async function createUser() {
       role: $('#nuRole').value, profile: $('#nuProfile').value, priority: $('#nuPrio').value,
       max_fps: +$('#nuFps').value, disk_quota_mb: +$('#nuQuota').value,
       allow_input: $('#nuInput').checked,
-      allow_clipboard: $('#nuClip').checked, allow_files: $('#nuFiles').checked});
+      allow_clipboard: $('#nuClip').checked, allow_files: $('#nuFiles').checked,
+      allow_display: $('#nuDisplay').checked});
     dlgUser.close(); loadUsers();
   } catch(e) { $('#nuErr').textContent = e.message; }
 }
@@ -418,7 +424,7 @@ async function loadInvites() {
                i.expired ? '<span class="badge b-err">истёк</span>' : '<span class="badge b-ok">активен</span>';
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><code>${esc(i.code)}</code></td><td>${esc(i.role)}</td><td>${esc(i.profile)}</td>
-      <td>${i.allow_input !== false ? '✓' : '—'}</td><td>${i.allow_files ? esc(i.disk_quota_mb) + ' МБ' : '—'}</td>
+      <td>${i.allow_input !== false ? '✓' : '—'}</td><td>${i.allow_files ? esc(i.disk_quota_mb) + ' МБ' : '—'}</td><td>${i.allow_display ? '✓' : '—'}</td>
       <td>${esc(i.created)}</td><td>${st}</td><td></td>`;
     tr.lastElementChild.appendChild(actionButton('Отозвать', 'danger small', () => revokeInvite(i.code)));
     tb.appendChild(tr);
@@ -431,6 +437,7 @@ async function createInvite() {
     allow_input: $('#invInput').checked,
     allow_clipboard: $('#invClip').checked,
     allow_files: $('#invFiles').checked,
+    allow_display: $('#invDisplay').checked,
     disk_quota_mb: +$('#invQuota').value,
     session_hours: $('#invSess').value ? +$('#invSess').value : null});
   alert('Одноразовый код приглашения:\n\n' + d.code + '\n\nПередайте его пользователю.');

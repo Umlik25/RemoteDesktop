@@ -86,6 +86,10 @@ dialog::backdrop { background:rgba(0,0,0,.7); }
     <option value="85">Q85 · очень высокое</option><option value="95">Q95 · максимум</option>
   </select>
   <select id="selRes" onchange="manualConfigChanged()" title="Разрешение потока"><option value="1">Разрешение…</option></select>
+  <select id="selDesktop" onchange="sendConfig()" title="Системное разрешение общего рабочего стола Windows" style="display:none">
+    <option value="host">Рабочий стол: хост</option>
+    <option value="client">Рабочий стол: мой экран</option>
+  </select>
   <select id="selAdaptive" onchange="sendConfig()" title="Авто снижает параметры при проблемах сети; фиксированный режим сохраняет выбранные значения">
     <option value="auto">Авто</option><option value="fixed">Фикс.</option>
   </select>
@@ -142,10 +146,11 @@ const clamp = v => v < 0 ? 0 : v > 1 ? 1 : v;
 const IS_MAC = /Mac|iPhone|iPad/i.test(navigator.platform || '')
   || /Mac/i.test((navigator.userAgentData && navigator.userAgentData.platform) || '');
 
-let ws, hello = null, lastStats = null, streamState = null;
+let ws, hello = null, lastStats = null, streamState = null, displayState = null;
+let desktopWH = null, initialConfigSent = false, resolutionBuilt = false;
 let configSeq = 0, lastConfigAck = 0;
 let inputEnabled = true, overlayOn = true;
-let permissions = {input:false, clipboard:false, files:false};
+let permissions = {input:false, clipboard:false, files:false, display:false};
 let captureMode = IS_MAC;   // клик по экрану захватывает мышь (актуально для Mac)
 let captured = false;       // сейчас Pointer Lock активен
 let macKeys = IS_MAC;       // Cmd -> Ctrl
@@ -161,7 +166,7 @@ let frames = 0, fpsShown = 0, bytesAcc = 0, bitrate = 0;
 let deltaCnt = 0, fullCnt = 0;
 let rtts = [], ping = 0, jitter = 0;
 let decodeMs = 0, frameGapMs = 0, lastFrameT = 0;
-let framesDropped = 0;
+let framesDropped = 0, frameAgeMs = 0, clockOffsetMs = 0;
 
 function ensureSelectValue(select, value, label) {
   const stringValue = String(value);
@@ -177,6 +182,7 @@ ensureSelectValue($('#selFps'), P.get('fps') || '60');
 ensureSelectValue($('#selQ'), P.get('quality') || '70', `Q${P.get('quality')}`);
 $('#selProfile').value = P.get('profile') || 'dev';
 $('#selAdaptive').value = P.get('adaptive') === '0' ? 'fixed' : 'auto';
+$('#selDesktop').value = P.get('desktop') === 'client' ? 'client' : 'host';
 
 // ================== КУРСОР: рисуется ПРЯМО В CANVAS ==================
 // Никаких DOM-слоёв: курсор компонуется с кадром при отрисовке, поэтому он
@@ -199,7 +205,7 @@ for (const [type, c] of Object.entries(CURSOR_SVGS)) {
   img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(c.svg);
   cursorImgs[type] = img;
 }
-function nativeWH() { return (hello && hello.screen) || [cv.width || 1, cv.height || 1]; }
+function nativeWH() { return desktopWH || (hello && hello.screen) || [cv.width || 1, cv.height || 1]; }
 function contentRect() {
   const r = cv.getBoundingClientRect();
   if (!cv.width || !cv.height || !r.width || !r.height) return {x:r.left, y:r.top, w:r.width||1, h:r.height||1};
@@ -256,8 +262,8 @@ function renderLoop() {
 requestAnimationFrame(renderLoop);
 
 // ================== ПОТОК: дельта-кадры ==================
-// Бинарное сообщение: [0xA7, ver, kind(0=full,1=delta), 0, x:u16, y:u16,
-// fw:u16, fh:u16] (little-endian) + JPEG. Дельта рисуется поверх base в (x,y).
+// v2: [0xA7, 2, kind, 0, x:u16, y:u16, fw:u16, fh:u16,
+// id:u32, capture_ts:f64] + JPEG. v1 и legacy full-JPEG тоже поддерживаются.
 function connect() {
   ws = new WebSocket(`ws://${HOST}:${PORT}/ws/stream?token=${encodeURIComponent(TOKEN)}`);
   ws.binaryType = 'arraybuffer';
@@ -284,24 +290,39 @@ function hint(text, ttl) {
 
 // Очередь кадров: дельты терять нельзя (каждая строится на предыдущей).
 // Если декодер безнадёжно отстал — очищаем очередь и просим полный кадр.
-let frameQueue = [], decoding = false;
+let frameQueue = [], decoding = false, refreshPending = false;
+function requestRefresh() {
+  if (refreshPending || !ws || ws.readyState !== 1) return;
+  refreshPending = true;
+  ws.send(JSON.stringify({type:'refresh'}));
+}
 function onMsg(e) {
   if (typeof e.data === 'string') { onText(JSON.parse(e.data)); return; }
   bytesAcc += e.data.byteLength;
   const dv = new DataView(e.data);
   let item;
-  if (e.data.byteLength > 12 && dv.getUint8(0) === 0xA7 && dv.getUint8(1) === 1) {
+  if (e.data.byteLength > 24 && dv.getUint8(0) === 0xA7 && dv.getUint8(1) === 2) {
+    item = {kind: dv.getUint8(2), x: dv.getUint16(4, true), y: dv.getUint16(6, true),
+            fw: dv.getUint16(8, true), fh: dv.getUint16(10, true),
+            id: dv.getUint32(12, true), captureMs: dv.getFloat64(16, true) * 1000,
+            buf: e.data.slice(24)};
+  } else if (e.data.byteLength > 12 && dv.getUint8(0) === 0xA7 && dv.getUint8(1) === 1) {
     item = {kind: dv.getUint8(2), x: dv.getUint16(4, true), y: dv.getUint16(6, true),
             fw: dv.getUint16(8, true), fh: dv.getUint16(10, true),
             buf: e.data.slice(12)};
   } else {
     item = {kind: 0, x: 0, y: 0, fw: 0, fh: 0, buf: e.data};   // legacy: целый JPEG
   }
-  frameQueue.push(item);
-  if (frameQueue.length > 8) {          // декодер не успевает — начать заново
+  // Полный кадр не зависит от предыдущих и сразу заменяет накопившийся хвост.
+  if (item.kind === 0 && frameQueue.length) {
     framesDropped += frameQueue.length;
     frameQueue = [];
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'refresh'}));
+  }
+  frameQueue.push(item);
+  if (frameQueue.length > 2) {          // задержка важнее показа устаревших кадров
+    framesDropped += frameQueue.length;
+    frameQueue = [];
+    requestRefresh();
     return;
   }
   if (!decoding) drainFrames();
@@ -319,18 +340,23 @@ async function drainFrames() {
         cv.width = fw; cv.height = fh;
         if (f.kind === 1) {   // дельта при несовпадении размера — нужен полный
           bmp.close();
-          if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'refresh'}));
+          requestRefresh();
           continue;
         }
       }
       bctx.drawImage(bmp, f.x, f.y);
       bmp.close();
-      if (f.kind === 1) deltaCnt++; else fullCnt++;
+      if (f.kind === 1) deltaCnt++; else { fullCnt++; refreshPending = false; }
       dirty = true;
       decodeMs = performance.now() - t0;
+      if (f.captureMs) frameAgeMs = Math.max(0, Date.now() + clockOffsetMs - f.captureMs);
       if (lastFrameT) frameGapMs = t0 - lastFrameT;
       lastFrameT = t0;
       frames++;
+      if (f.id && ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({type:'frame_ack', id:f.id,
+          queue:frameQueue.length, decode_ms:decodeMs}));
+      }
     } catch(_) { framesDropped++; }
   }
   decoding = false;
@@ -339,8 +365,10 @@ async function drainFrames() {
 async function onText(d) {
   if (d.type === 'hello') {
     hello = d;
+    desktopWH = d.screen || desktopWH;
     applyHostLimits(d.limits || (d.stream && d.stream.limits));
     applyPermissions(d.permissions || {});
+    applyDisplayState(d.display, false);
     document.title = `App_Remote — ${d.host_name}`;
     $('#msg').style.display = 'none';
     $('#stage').style.display = ''; toolbar.style.display = 'flex';
@@ -360,6 +388,7 @@ async function onText(d) {
     if (!requestId || requestId >= lastConfigAck) {
       lastConfigAck = requestId;
       applyStreamState(d, true);
+      applyDisplayState(d.display, true);
     }
   } else if (d.type === 'pong') {
     const rtt = performance.now() - d.t;
@@ -367,9 +396,13 @@ async function onText(d) {
     ping = rtts.reduce((a,b)=>a+b,0) / rtts.length;
     const mean = ping;
     jitter = Math.sqrt(rtts.reduce((a,b)=>a+(b-mean)**2,0) / rtts.length);
+    if (Number.isFinite(Number(d.server_wall)) && Number.isFinite(Number(d.wall))) {
+      clockOffsetMs = Number(d.server_wall) - (Number(d.wall) + rtt / 2);
+    }
   } else if (d.type === 'stats') {
     lastStats = d;
     if (d.permissions) applyPermissions(d.permissions);
+    if (d.display) applyDisplayState(d.display, true);
     if (d.stream) applyStreamState(d.stream, false);
     else applyStreamState({
       selected: (d.session && d.session.requested) || {
@@ -393,14 +426,15 @@ async function onText(d) {
 setInterval(() => {
   fpsShown = frames; frames = 0;
   bitrate = bytesAcc * 8 / 1e6; bytesAcc = 0;
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'ping', t: performance.now()}));
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'ping', t: performance.now(), wall:Date.now()}));
   if (overlayOn) renderOverlay();
 }, 1000);
 
 function renderOverlay() {
   const ov = $('#overlay');
-  ov.style.display = overlayOn ? '' : 'none';
+  ov.style.display = overlayOn ? 'block' : 'none';
   if (!overlayOn) return;
+  positionOverlay();
   const s = lastStats || {}, h = s.host || {}, sess = s.session || {};
   const selected = (streamState && streamState.selected) || sess.requested || {};
   const applied = (streamState && streamState.applied) || {};
@@ -412,24 +446,36 @@ function renderOverlay() {
   const modeTxt = captured ? 'захват мыши' : (inputEnabled ? 'оконный' : 'просмотр');
   const total = deltaCnt + fullCnt;
   const deltaShare = total ? Math.round(deltaCnt * 100 / total) : 0;
+  const ackLag = sess.ack_latency_ms != null ? Number(sess.ack_latency_ms).toFixed(1) : '—';
+  const desktop = (displayState && displayState.current) || {};
   ov.innerHTML = `
     <span class="badge ${routeCls}">${esc(route)}</span> <b>${esc(hello ? hello.host_name : '')}</b>
     <div class="sec">ПОТОК</div>
     FPS: <b>${fpsShown}</b> (применено ${applied.fps ?? s.fps_target ?? $('#selFps').value}, выбрано ${selected.fps ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
     Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>MJPEG-дельта</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
     Поток: <b>${cv.width}×${cv.height}</b> · Мой экран: <b>${Math.round(screen.width*(devicePixelRatio||1))}×${Math.round(screen.height*(devicePixelRatio||1))}</b><br>
+    Рабочий стол Windows: <b>${desktop.width ? desktop.width + '×' + desktop.height : '—'}</b> · Очередь: <b>${sess.client_queue ?? frameQueue.length}</b><br>
     Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>
     Профиль: <b>${esc(sess.profile || $('#selProfile').value)}</b> · Q${esc(applied.quality ?? s.quality ?? '—')} (выбрано Q${esc(selected.quality ?? $('#selQ').value)}) · Адаптация: <b>${selected.adaptive === false ? 'фикс.' : 'авто'}</b><br>
     Режим: <b>${modeTxt}</b> · Набор: <b>${keyMode === 'text' ? 'текст' : 'игра'}</b>
     <div class="sec">ЗАДЕРЖКИ</div>
     Ping: <b>${ping.toFixed(1)} мс</b> · Jitter: <b>${jitter.toFixed(1)} мс</b><br>
     Ввод (оценка): <b>~${inputLat} мс</b> · Декодирование: <b>${decodeMs.toFixed(1)} мс</b><br>
+    Отправка→декод: <b>${ackLag} мс</b> · Захват→декод: <b>${frameAgeMs.toFixed(1)} мс</b><br>
     Отброшено кадров: <b>${framesDropped}</b>
     <div class="sec">ХОСТ</div>
     CPU: <b>${h.cpu_percent ?? '—'}%</b> · RAM: <b>${h.ram_percent ?? '—'}%</b><br>
     GPU: <b>${h.gpu_percent ?? 'н/д'}%</b> · VRAM: <b>${h.vram_percent ?? 'н/д'}%</b>
     ${inputWarn}
     ${warn}`;
+}
+
+function positionOverlay() {
+  const ov = $('#overlay');
+  if (!overlayOn || getComputedStyle(toolbar).display === 'none') return;
+  const top = toolbar.classList.contains('hidden')
+    ? 10 : Math.ceil(toolbar.getBoundingClientRect().bottom + 8);
+  ov.style.top = `${top}px`;
 }
 
 // ------- выбор разрешения потока (по родному разрешению хоста)
@@ -498,8 +544,30 @@ function applyStreamState(state, announce) {
   if (announce && state.reasons && state.reasons.length) hint(state.reasons.join('. '), 6000);
   if (overlayOn) renderOverlay();
 }
-function buildResSelect() {
+function applyDisplayState(state, authoritative=true) {
+  if (!state) return;
+  const before = desktopWH && desktopWH.join('x');
+  displayState = state;
+  if (state.current && state.current.width && state.current.height) {
+    desktopWH = [Number(state.current.width), Number(state.current.height)];
+  }
+  const sel = $('#selDesktop');
+  sel.style.display = state.available ? '' : 'none';
+  sel.disabled = !state.allowed;
+  if (authoritative && (initialConfigSent || P.get('desktop') !== 'client')) {
+    sel.value = state.mode === 'client' ? 'client' : 'host';
+  }
+  sel.title = !state.available
+    ? 'Системное разрешение доступно только на Windows-хосте'
+    : !state.allowed
+      ? 'Владелец хоста не разрешил менять общий дисплей'
+      : 'Меняет системное разрешение общего рабочего стола Windows; при отключении оно восстановится';
+  const after = desktopWH && desktopWH.join('x');
+  if (resolutionBuilt && before !== after) buildResSelect(false);
+}
+function buildResSelect(send=true) {
   const sel = $('#selRes');
+  const previousScale = Number(sel.value);
   const [nw, nh] = nativeWH();
   sel.innerHTML = '';
   const add = (label, val) => {
@@ -524,7 +592,8 @@ function buildResSelect() {
     const [w, actualH] = streamDimensions(scale);
     add(`${w}×${actualH}`, scale);
   }
-  const want = P.get('scale') || 'auto';
+  const want = resolutionBuilt && Number.isFinite(previousScale)
+    ? previousScale : (P.get('scale') || 'auto');
   if (want === 'auto') {
     // дельта-кадры сильно снижают трафик, но полные кадры 1440p/4K всё ещё
     // тяжёлые — для плавности стартуем с 1080p
@@ -537,7 +606,8 @@ function buildResSelect() {
   } else {
     selectScale(want);
   }
-  sendConfig();
+  resolutionBuilt = true;
+  if (send) sendConfig();
 }
 
 function toggleOverlay() { overlayOn = !overlayOn; renderOverlay(); }
@@ -691,9 +761,13 @@ function sendConfig() {
     hint('Не удалось прочитать параметры потока', 4000); return;
   }
   const requestId = ++configSeq;
+  initialConfigSent = true;
   setStreamStatus(null, true);
   ws.send(JSON.stringify({type:'config', request_id:requestId, fps, quality, scale,
-    profile:$('#selProfile').value, adaptive:$('#selAdaptive').value === 'auto'}));
+    profile:$('#selProfile').value, adaptive:$('#selAdaptive').value === 'auto',
+    desktop_mode:$('#selDesktop').value,
+    client_width:Math.round(screen.width * (window.devicePixelRatio || 1)),
+    client_height:Math.round(screen.height * (window.devicePixelRatio || 1))}));
 }
 function manualConfigChanged() {
   $('#selProfile').value = 'custom';
@@ -719,8 +793,9 @@ let tbTimer = null;
 function pokeToolbar() {
   if (captured) return;
   toolbar.classList.remove('hidden');
+  positionOverlay();
   clearTimeout(tbTimer);
-  tbTimer = setTimeout(() => toolbar.classList.add('hidden'), 2500);
+  tbTimer = setTimeout(() => { toolbar.classList.add('hidden'); positionOverlay(); }, 2500);
 }
 document.addEventListener('mousemove', pokeToolbar);
 

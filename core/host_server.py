@@ -20,6 +20,7 @@ import math
 import os
 import socket
 import struct
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -28,7 +29,7 @@ from urllib.parse import quote, urlsplit
 import psutil
 from aiohttp import web, WSMsgType
 
-from . import auth, capability, hwinfo, state
+from . import auth, capability, display, hwinfo, state
 
 try:
     import mss
@@ -173,6 +174,12 @@ def _diff_bbox(a, b):
         if a.shape != b.shape:
             return None
         h, w = b.shape[:2]
+        # На видео/играх почти весь экран меняется. Быстрая редкая сетка
+        # позволяет сразу выбрать full-frame, не выполняя два полных прохода
+        # по многомегабайтному BGRA-кадру.
+        sample = (a[::16, ::16] != b[::16, ::16]).any(axis=2)
+        if sample.size and sample.mean() > 0.35:
+            return None
         rows = (a.reshape(h, -1) != b.reshape(h, -1)).any(axis=1)
         idx = np.flatnonzero(rows)
         if idx.size == 0:
@@ -202,17 +209,24 @@ class ScreenCapture:
         self.on_frame = None       # колбэк «появился новый кадр» (из потока захвата)
         self.bbox_ring = collections.deque(maxlen=600)   # (seq, bbox|None)
         self._thread = None
+        self._restart = threading.Event()
+        self._seq = 0
 
     def start(self):
         if not CAPTURE_OK or self.running:
             return
-        import threading
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self.running = False
+        self._restart.set()
+
+    def restart(self):
+        """Пересоздать DXGI/GDI после смены display mode."""
+        self.bbox_ring.clear()
+        self._restart.set()
 
     def bbox_since(self, since_seq, upto_seq):
         """Объединённая область изменений за (since_seq, upto_seq].
@@ -238,17 +252,22 @@ class ScreenCapture:
             x1 = max(x1, b[2]); y1 = max(y1, b[3])
         return (x0, y0, x1, y1) if x1 > x0 else None
 
-    def _publish(self, arr, w, h, seq, bbox):
-        self.bbox_ring.append((seq, bbox))
-        self.frame = (arr if isinstance(arr, bytes) else arr.tobytes(),
-                      w, h, time.time(), seq)
+    def _publish(self, arr, w, h, bbox):
+        self._seq += 1
+        self.bbox_ring.append((self._seq, bbox))
+        # DXcam уже возвращает отдельный numpy-кадр. Не превращаем каждый
+        # 1440p BGRA frame в ещё одну копию на 14+ МБ перед кодированием.
+        self.frame = (arr, w, h, time.time(), self._seq)
         if self.on_frame:
             self.on_frame()
 
     def _loop(self):
-        if DXCAM_OK and self._loop_dxcam():
-            return
-        self._loop_mss()
+        while self.running:
+            self._restart.clear()
+            if DXCAM_OK and self._loop_dxcam():
+                continue
+            if self.running:
+                self._loop_mss()
 
     def _loop_dxcam(self):
         """DXGI Desktop Duplication: быстрый захват, grab() сам возвращает None,
@@ -262,12 +281,27 @@ class ScreenCapture:
         print("[App_Remote] Захват экрана: DXGI Desktop Duplication (быстрый)")
         self.backend = "dxgi"
         self.mon_offset = (0, 0)   # dxcam захватывает основной монитор с (0,0)
-        seq = 0
         errors = 0
         prev = None
         try:
-            while self.running:
-                t0 = time.perf_counter()
+            target = max(1, min(240, int(self.max_fps)))
+            # Внутренний поток DXcam использует high-resolution pacing и
+            # кольцевой буфер. grab() при активном start() читает только свежий
+            # кадр из этого буфера, не заставляя отправителя догонять историю.
+            try:
+                cam.start(target_fps=target, video_mode=False)
+            except Exception:
+                return False
+            while self.running and not self._restart.is_set():
+                requested = max(1, min(240, int(self.max_fps)))
+                if requested != target:
+                    try:
+                        cam.stop()
+                        cam.start(target_fps=requested, video_mode=False)
+                    except Exception:
+                        return False
+                    target = requested
+                    prev = None
                 try:
                     f = cam.grab()
                     errors = 0
@@ -282,12 +316,16 @@ class ScreenCapture:
                     bbox = _diff_bbox(prev, f) if (prev is not None and NP_OK) else None
                     prev = f
                     if bbox is not False:    # False = кадры идентичны, пропускаем
-                        seq += 1
                         h, w = f.shape[:2]
-                        self._publish(f, w, h, seq, bbox)
-                dt = time.perf_counter() - t0
-                time.sleep(max(0.001, 1.0 / max(self.max_fps, 1) - dt))
+                        self._publish(f, w, h, bbox)
+                # Потребитель только опрашивает latest-frame; точный FPS задаёт
+                # поток DXcam. 1–2 мс здесь ограничивают CPU без длинной очереди.
+                time.sleep(min(0.002, 0.25 / target))
         finally:
+            try:
+                cam.stop()
+            except Exception:
+                pass
             try:
                 cam.release()
             except Exception:
@@ -296,13 +334,13 @@ class ScreenCapture:
 
     def _loop_mss(self):
         prev = None
-        seq = 0
         self.backend = "gdi"
         print("[App_Remote] Захват экрана: GDI/mss (запасной путь)")
         with mss.mss() as sct:
             mon = sct.monitors[1]
             self.mon_offset = (mon.get("left", 0), mon.get("top", 0))
-            while self.running:
+            next_tick = time.perf_counter()
+            while self.running and not self._restart.is_set():
                 t0 = time.perf_counter()
                 try:
                     img = sct.grab(mon)
@@ -315,14 +353,16 @@ class ScreenCapture:
                             bbox = _diff_bbox(a, b)
                         prev = raw
                         if bbox is not False:
-                            seq += 1
-                            self._publish(raw, img.width, img.height, seq, bbox)
+                            self._publish(raw, img.width, img.height, bbox)
                 except Exception:
                     time.sleep(0.5)
                     continue
-                dt = time.perf_counter() - t0
-                delay = max(0.0, 1.0 / max(self.max_fps, 1) - dt)
-                time.sleep(delay)
+                period = 1.0 / max(self.max_fps, 1)
+                next_tick += period
+                now = time.perf_counter()
+                if next_tick < now - period:
+                    next_tick = now
+                time.sleep(max(0.0, next_tick - now))
 
 
 def encode_jpeg(frame, quality, scale, region=None):
@@ -350,7 +390,8 @@ def encode_jpeg(frame, quality, scale, region=None):
         sw, sh = max(2, int(ex - sx)), max(2, int(ey - sy))
     if CV2_OK:
         try:
-            arr = np.frombuffer(raw, np.uint8).reshape(h, w, 4)[y0:y1, x0:x1]
+            source = raw if isinstance(raw, np.ndarray) else np.frombuffer(raw, np.uint8).reshape(h, w, 4)
+            arr = source[y0:y1, x0:x1]
             if scale < 0.999:
                 arr = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
             bgr = cv2.cvtColor(np.ascontiguousarray(arr), cv2.COLOR_BGRA2BGR)
@@ -359,7 +400,8 @@ def encode_jpeg(frame, quality, scale, region=None):
                 return buf.tobytes(), sx, sy, fw, fh
         except Exception:
             pass
-    img = Image.frombytes("RGB", (w, h), raw, "raw", "BGRX")
+    raw_bytes = raw.tobytes() if hasattr(raw, "tobytes") else raw
+    img = Image.frombytes("RGB", (w, h), raw_bytes, "raw", "BGRX")
     if region is not None:
         img = img.crop((x0, y0, x1, y1))
     if scale < 0.999:
@@ -533,10 +575,20 @@ class Session:
         self.priority = user.get("priority", "normal")
         self.frames = 0
         self.bytes = 0
+        self.total_bytes = 0
         self.last_bytes_ts = time.time()
         self.bitrate_mbps = 0.0
         self.warnings = []
         self.kick_reason = None
+        self.desktop_mode = "host"
+        self.desktop_size = None
+        self.send_id = 0
+        self.last_ack_id = 0
+        self.ack_latency_ms = 0.0
+        self.client_queue = 0
+        self.client_decode_ms = 0.0
+        self.stale_drops = 0
+        self.sent_times = collections.deque(maxlen=240)
 
     def effective(self):
         """Параметры с учётом деградации (нагрузка хоста + сеть):
@@ -564,6 +616,9 @@ class Session:
             "degrade": self.degrade, "net_degrade": self.net_degrade,
             "bitrate_mbps": round(self.bitrate_mbps, 1),
             "frames": self.frames,
+            "ack_latency_ms": round(self.ack_latency_ms, 1),
+            "client_queue": self.client_queue,
+            "stale_drops": self.stale_drops,
         }
 
 
@@ -572,6 +627,8 @@ class HostServer:
         self.config = config
         self.capture = ScreenCapture()
         self.injector = InputInjector()
+        self.display = display.DisplayManager()
+        self._display_owner = None
         self.sessions = {}
         self.static_info = None
         self.bench = None
@@ -641,6 +698,7 @@ class HostServer:
         r.add_get("/ws/panel", self.ws_panel)
         r.add_get("/ws/stream", self.ws_stream)
         app.on_startup.append(self._on_start)
+        app.on_cleanup.append(self._on_cleanup)
         return app
 
     async def _on_start(self, app):
@@ -661,6 +719,19 @@ class HostServer:
         asyncio.create_task(self._beacon_loop())
         asyncio.create_task(self._governor_loop())
         state.audit("host.start", "system", {"port": self.config["host_port"]})
+
+    async def _on_cleanup(self, app):
+        capture = getattr(self, "capture", None)
+        if capture and hasattr(capture, "stop"):
+            capture.stop()
+        if getattr(self, "_display_owner", None):
+            manager = getattr(self, "display", None)
+            if manager and manager.available:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(_executor, manager.restore)
+                except Exception:
+                    pass
+            self._display_owner = None
 
     # ------------------------------------------------------------ утилиты
 
@@ -784,16 +855,23 @@ class HostServer:
 
     def _permission_payload(self, user):
         input_allowed, input_reason = self._input_permission(user)
+        display_allowed = bool(user and (user.get("role") in ("owner", "admin")
+                                        or user.get("allow_display", False)))
         return {
             "input": input_allowed,
             "input_reason": input_reason,
             "work_only_mode": self.config.get("work_only_mode", False),
             "clipboard": bool(user and user.get("allow_clipboard", False)),
             "files": bool(user and user.get("allow_files", False)),
+            "display": bool(display_allowed and getattr(self, "display", None)
+                            and self.display.available),
         }
 
     def _frame_notify_threadsafe(self):
         """Из потока захвата: разбудить отправителей кадров в event loop."""
+        frame = self.capture.frame
+        if frame:
+            self.injector.screen_wh = (frame[1], frame[2])
         loop = self._loop
         if loop is not None:
             try:
@@ -887,6 +965,110 @@ class HostServer:
             "min_scale": 0.25, "max_scale": 1.0,
         }
 
+    def _display_state(self, sess=None, user=None):
+        manager = getattr(self, "display", None)
+        available = bool(manager and manager.available)
+        allowed = bool(user and (user.get("role") in ("owner", "admin")
+                                 or user.get("allow_display", False)))
+        try:
+            current = manager.current() if available else None
+            modes = manager.modes() if available else []
+        except Exception:
+            available, current, modes = False, None, []
+        return {
+            "available": available,
+            "allowed": available and allowed,
+            "mode": sess.desktop_mode if sess else "host",
+            "current": current,
+            "selected": sess.desktop_size if sess else None,
+            "modes": modes,
+            "shared": True,
+        }
+
+    async def _apply_display_config(self, sess, data, user):
+        requested = data.get("desktop_mode")
+        if requested not in ("host", "client"):
+            return self._display_state(sess, user), []
+        reasons = []
+        manager = getattr(self, "display", None)
+        allowed = bool(user and (user.get("role") in ("owner", "admin")
+                                 or user.get("allow_display", False)))
+        if not manager or not manager.available:
+            reasons.append("Системное разрешение можно менять только на Windows-хосте")
+            return self._display_state(sess, user), reasons
+        if not allowed:
+            reasons.append("Владелец хоста не разрешил этой учётной записи менять дисплей")
+            return self._display_state(sess, user), reasons
+        if requested == "host":
+            if getattr(self, "_display_owner", None) == sess.sid:
+                try:
+                    restored = await asyncio.get_running_loop().run_in_executor(
+                        _executor, manager.restore)
+                except Exception:
+                    restored = False
+                if restored:
+                    self._display_owner = None
+                    sess.desktop_mode = "host"
+                    sess.desktop_size = None
+                    self.capture.restart()
+                    sess.force_full = True
+                else:
+                    reasons.append("Не удалось восстановить исходное разрешение хоста")
+            return self._display_state(sess, user), reasons
+        display_owner = getattr(self, "_display_owner", None)
+        if display_owner not in (None, sess.sid):
+            reasons.append("Разрешением общего дисплея уже управляет другая сессия")
+            return self._display_state(sess, user), reasons
+        if display_owner is None and len(self.sessions) > 1:
+            reasons.append("Системное разрешение нельзя менять при нескольких активных сессиях")
+            return self._display_state(sess, user), reasons
+        raw_width = self._stream_number(data.get("client_width"), 0)
+        raw_height = self._stream_number(data.get("client_height"), 0)
+        if raw_width <= 0 or raw_height <= 0:
+            reasons.append("Клиент не сообщил размер своего экрана")
+            return self._display_state(sess, user), reasons
+        width = int(max(800, min(8192, raw_width)))
+        height = int(max(600, min(8192, raw_height)))
+        try:
+            candidate = display.best_mode(manager.modes(), width, height)
+        except Exception:
+            candidate = None
+        selected = sess.desktop_size or {}
+        if (display_owner == sess.sid and sess.desktop_mode == "client" and candidate
+                and selected.get("width") == candidate.get("width")
+                and selected.get("height") == candidate.get("height")):
+            return self._display_state(sess, user), reasons
+        try:
+            ok, chosen, error = await asyncio.get_running_loop().run_in_executor(
+                _executor, manager.set_best, width, height)
+        except Exception as exc:
+            ok, chosen, error = False, None, f"Ошибка Windows Display API: {exc}"
+        if not ok:
+            reasons.append(error or "Windows не применила выбранное разрешение")
+            return self._display_state(sess, user), reasons
+        self._display_owner = sess.sid
+        sess.desktop_mode = "client"
+        sess.desktop_size = chosen
+        self.capture.restart()
+        sess.force_full = True
+        if chosen["width"] != width or chosen["height"] != height:
+            reasons.append(
+                f"Применён ближайший поддерживаемый режим {chosen['width']}×{chosen['height']} "
+                f"вместо {width}×{height}")
+        return self._display_state(sess, user), reasons
+
+    async def _release_display(self, sess):
+        if getattr(self, "_display_owner", None) != sess.sid:
+            return
+        manager = getattr(self, "display", None)
+        if manager and manager.available:
+            try:
+                await asyncio.get_running_loop().run_in_executor(_executor, manager.restore)
+                self.capture.restart()
+            except Exception:
+                pass
+        self._display_owner = None
+
     @staticmethod
     def _stream_number(value, fallback):
         try:
@@ -894,6 +1076,29 @@ class HostServer:
         except (TypeError, ValueError):
             return fallback
         return number if math.isfinite(number) else fallback
+
+    def _apply_frame_ack(self, sess, data):
+        """Обратная связь браузера: очередь декодера и end-to-end lag кадра."""
+        try:
+            ack_id = max(0, int(data.get("id", 0)))
+            queue = max(0, min(120, int(data.get("queue", 0))))
+            decode_ms = max(0.0, min(10_000.0, float(data.get("decode_ms", 0))))
+        except (TypeError, ValueError):
+            return
+        if ack_id < sess.last_ack_id:
+            return
+        sent_at = None
+        while sess.sent_times and sess.sent_times[0][0] <= ack_id:
+            frame_id, frame_sent_at = sess.sent_times.popleft()
+            if frame_id == ack_id:
+                sent_at = frame_sent_at
+        if sent_at is not None:
+            sample = max(0.0, (time.monotonic() - sent_at) * 1000)
+            sess.ack_latency_ms = (sample if not sess.ack_latency_ms
+                                   else sess.ack_latency_ms * 0.75 + sample * 0.25)
+        sess.last_ack_id = ack_id
+        sess.client_queue = queue
+        sess.client_decode_ms = decode_ms
 
     def _stream_state(self, sess, user=None, reasons=None):
         """Выбранные и фактически применённые параметры для ответа клиенту."""
@@ -1014,6 +1219,16 @@ class HostServer:
         except ValueError:
             return "Internet Direct"
 
+    @staticmethod
+    def _tune_stream_socket(request):
+        """Не копить мелкие control/input пакеты в TCP Nagle-буфере."""
+        try:
+            sock = request.transport.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (AttributeError, OSError):
+            pass
+
     def host_name(self):
         return self.config.get("host_name") or self.static_info.get("hostname", "Host")
 
@@ -1128,6 +1343,7 @@ class HostServer:
                              allow_input=d.get("allow_input", True),
                              allow_clipboard=d.get("allow_clipboard", False),
                              allow_files=d.get("allow_files", False),
+                             allow_display=d.get("allow_display", False),
                              max_fps=int(d.get("max_fps", 60)),
                              disk_quota_mb=int(d.get("disk_quota_mb", 2048)), actor=actor)
         except ValueError as e:
@@ -1311,6 +1527,7 @@ class HostServer:
                                       allow_input=d.get("allow_input", True),
                                       allow_clipboard=d.get("allow_clipboard", False),
                                       allow_files=d.get("allow_files", False),
+                                      allow_display=d.get("allow_display", False),
                                       session_hours=d.get("session_hours"),
                                       disk_quota_mb=d.get("disk_quota_mb", 512), actor=actor)
         except (TypeError, ValueError) as e:
@@ -1415,8 +1632,13 @@ class HostServer:
         if not CAPTURE_OK:
             raise web.HTTPServiceUnavailable(text="Захват экрана недоступен (нет mss/Pillow)")
 
-        ws = web.WebSocketResponse(max_msg_size=8 * 2**20)
+        # JPEG уже сжат: permessage-deflate только тратит CPU и добавляет jitter.
+        # Небольшой writer_limit быстрее включает backpressure вместо скрытой
+        # очереди устаревших кадров в памяти процесса.
+        ws = web.WebSocketResponse(max_msg_size=8 * 2**20, compress=False,
+                                   writer_limit=64 * 1024)
         await ws.prepare(request)
+        self._tune_stream_socket(request)
         sess = Session(ws, username, user, request.remote, self._route_for(request.remote))
         self.sessions[sess.sid] = sess
         state.log_session_event("connect", {"sid": sess.sid, "username": username,
@@ -1432,6 +1654,8 @@ class HostServer:
                             "fps": sess.fps, "quality": sess.quality, "scale": sess.scale,
                             "stream": stream_state,
                             "limits": stream_state["limits"],
+                            "display": self._display_state(sess, user),
+                            "transport": {"direct": True, "low_latency": True},
                             "permissions": self._permission_payload(user),
                             "isolation_note": "MVP: все удалённые сессии видят общий рабочий стол хоста. "
                                               "Изоляция через VM — этап 2."})
@@ -1447,15 +1671,27 @@ class HostServer:
                     d = json.loads(msg.data)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(d, dict):
+                    continue
                 t = d.get("type")
                 current_user = auth.get_user(username)
                 if not auth.user_is_active(current_user):
                     await self._kick(sess, "Доступ истёк или был отозван")
                     break
                 if t == "ping":
-                    await ws.send_json({"type": "pong", "t": d.get("t")})
+                    await ws.send_json({"type": "pong", "t": d.get("t"),
+                                        "wall": d.get("wall"),
+                                        "server_wall": time.time() * 1000})
                 elif t == "config":
-                    await ws.send_json(self._apply_stream_config(sess, d, current_user))
+                    display_state, display_reasons = await self._apply_display_config(
+                        sess, d, current_user)
+                    applied = self._apply_stream_config(sess, d, current_user)
+                    applied["display"] = display_state
+                    applied["reasons"] = list(dict.fromkeys(
+                        applied.get("reasons", []) + display_reasons))
+                    await ws.send_json(applied)
+                elif t == "frame_ack":
+                    self._apply_frame_ack(sess, d)
                 elif t == "refresh":
                     # клиент просит полный кадр (потерял дельта-цепочку)
                     sess.force_full = True
@@ -1476,11 +1712,13 @@ class HostServer:
             sender.cancel()
             stats.cancel()
             cursor.cancel()
+            await asyncio.gather(sender, stats, cursor, return_exceptions=True)
+            await self._release_display(sess)
             self.sessions.pop(sess.sid, None)
             self._refresh_capture_fps()
             state.log_session_event("disconnect", {
                 "sid": sess.sid, "username": username, "ip": sess.ip,
-                "frames": sess.frames, "mb_sent": round(sess.bytes / 2**20, 1),
+                "frames": sess.frames, "mb_sent": round(sess.total_bytes / 2**20, 1),
                 "duration_s": int(time.time() - sess.connected_at),
                 "reason": sess.kick_reason or "client"})
         return ws
@@ -1488,10 +1726,10 @@ class HostServer:
     async def _frame_sender(self, sess):
         """Отправка кадров: ДЕЛЬТА-КАДРЫ (только изменённые области экрана) —
         это радикально снижает битрейт и задержку по Wi-Fi. Полный кадр идёт
-        при подключении, смене параметров, запросе клиента и раз в ~5 с после
-        дельт (заживление возможных швов). Бинарный формат:
-        12-байтовый заголовок [A7, ver, kind(0=full/1=delta), 0, x, y, fw, fh] + JPEG.
-        Адаптация к каналу: резкий затык → мгновенная ступень деградации."""
+        при подключении, смене параметров, запросе клиента и редко после дельт.
+        Бинарный формат v2: 24-байтовый заголовок
+        [A7, 2, kind, 0, x, y, fw, fh, id:u32, capture_ts:f64] + JPEG.
+        Адаптация учитывает подтверждённую браузером очередь и задержку."""
         last_seq = -1
         last_params = None
         next_pick = 0.0            # следующий дедлайн кадра (с переносом остатка)
@@ -1500,6 +1738,7 @@ class HostServer:
         dirty_since_full = False
         send_ewma = 0.0
         last_adapt = time.monotonic()
+        stale_skips = 0
         while not sess.ws.closed:
             ev = self._frame_evt
             fps, quality, scale = self._stream_params(sess)
@@ -1510,7 +1749,9 @@ class HostServer:
             frame = self.capture.frame
             now = time.monotonic()
             params = (int(quality), round(scale, 6))
-            heal = dirty_since_full and now - last_full_t >= 5.0
+            # WebSocket/TCP надёжен; частые full-frame создавали заметный пик
+            # битрейта каждые 5 секунд. Редкий кадр нужен лишь для самопроверки.
+            heal = dirty_since_full and now - last_full_t >= 30.0
             changed = frame is not None and (
                 frame[4] != last_seq or params != last_params
                 or sess.force_full or heal)
@@ -1544,12 +1785,26 @@ class HostServer:
                     if (x1 - x0) * (y1 - y0) > 0.6 * frame[1] * frame[2]:
                         region = None
             try:
+                encode_started = time.perf_counter()
                 data, sx, sy, fw, fh = await self._encoded(frame, quality, scale, region)
             except Exception:
                 await asyncio.sleep(0.1)
                 continue
+            encode_dt = time.perf_counter() - encode_started
+            latest = self.capture.frame
+            if (latest is not None and latest[4] != frame[4]
+                    and encode_dt > budget * 0.65 and stale_skips < 1):
+                # Не отправляем кадр, который устарел ещё во время JPEG-кодирования.
+                stale_skips += 1
+                sess.stale_drops += 1
+                continue
+            stale_skips = 0
             kind = 1 if region is not None else 0
-            msg = struct.pack("<BBBBHHHH", 0xA7, 1, kind, 0, sx, sy, fw, fh) + data
+            sess.send_id = (sess.send_id + 1) & 0xffffffff
+            if sess.send_id == 0:
+                sess.send_id = 1
+            msg = struct.pack("<BBBBHHHHId", 0xA7, 2, kind, 0, sx, sy, fw, fh,
+                              sess.send_id, float(frame[3])) + data
             last_seq, last_params = frame[4], params
             sess.force_full = False
             if kind == 0:
@@ -1558,27 +1813,37 @@ class HostServer:
             else:
                 dirty_since_full = True
             t0 = time.perf_counter()
+            sent_at = time.monotonic()
             try:
                 await sess.ws.send_bytes(msg)
             except (ConnectionError, RuntimeError):
                 break
             send_dt = time.perf_counter() - t0
+            sess.sent_times.append((sess.send_id, sent_at))
             send_ewma = send_dt if not send_ewma else send_ewma * 0.7 + send_dt * 0.3
             now2 = time.monotonic()
             if sess.adaptive:
+                ack_limit = max(80.0, budget * 5 * 1000)
+                lag_bad = (sess.client_queue > 1
+                           or (sess.last_ack_id and sess.ack_latency_ms > ack_limit))
+                lag_good = (sess.client_queue == 0
+                            and (not sess.last_ack_id
+                                 or sess.ack_latency_ms < max(45.0, budget * 3 * 1000)))
                 if send_dt > max(0.25, budget * 4) and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
                     sess.net_degrade += 1  # резкий затык канала — реагируем сразу
                     last_adapt = now2
-                elif send_ewma > budget * 1.4 and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
+                elif (lag_bad or send_ewma > budget * 1.4) and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
                     sess.net_degrade += 1
                     last_adapt = now2
-                elif send_ewma < budget * 0.4 and sess.net_degrade > 0 and now2 - last_adapt > 6.0:
+                elif (lag_good and send_ewma < budget * 0.4
+                      and sess.net_degrade > 0 and now2 - last_adapt > 8.0):
                     sess.net_degrade -= 1
                     last_adapt = now2
             elif sess.net_degrade:
                 sess.net_degrade = 0
             sess.frames += 1
             sess.bytes += len(msg)
+            sess.total_bytes += len(msg)
             nowt = time.time()
             if nowt - sess.last_bytes_ts >= 1.0:
                 sess.bitrate_mbps = sess.bytes * 8 / 1e6 / (nowt - sess.last_bytes_ts)
@@ -1603,6 +1868,9 @@ class HostServer:
                 warn.append(f"Канал не успевает за потоком (ступень {sess.net_degrade}): "
                             f"качество временно снижено. Помогут меньший FPS/масштаб "
                             f"или кабельное подключение.")
+            if sess.client_queue > 1:
+                warn.append(f"Браузер не успевает декодировать поток: в очереди "
+                            f"{sess.client_queue} кадр(а)")
             try:
                 await sess.ws.send_json({
                     "type": "stats", "host": load,
@@ -1611,6 +1879,7 @@ class HostServer:
                     "route": sess.route,
                     "fps_target": fps, "quality": quality, "scale": scale,
                     "stream": self._stream_state(sess, user),
+                    "display": self._display_state(sess, user),
                     "permissions": self._permission_payload(user),
                     "warnings": warn,
                 })

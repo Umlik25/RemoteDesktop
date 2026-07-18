@@ -75,6 +75,10 @@
     </select></label>
     <label class="f" style="flex:1">Разрешение<select id="cScale"><option value="auto" selected>Авто (рекоменд.)</option><option value="1">Родное (100%)</option><option value="0.75">75%</option><option value="0.5">50%</option></select></label>
   </div>
+  <label class="f">Рабочий стол Windows<select id="cDesktop">
+    <option value="host" selected>Оставить разрешение хоста</option>
+    <option value="client">Под разрешение этого ноутбука</option>
+  </select></label>
   <p class="muted">Фактические FPS и качество зависят от сети, кодирования на хосте и возможностей этого устройства. 90–144 FPS требуют быстрой LAN.</p>
   <div class="row">
     <button onclick="doConnect()">Подключиться</button>
@@ -200,7 +204,8 @@ async function doConnect() {
     const d = await r.json();
     const q = new URLSearchParams({host: ip, port,
       fps: $('#cFps').value, quality: $('#cQ').value, scale: $('#cScale').value,
-      profile: $('#cProfile').value, adaptive: '1', name: current.name});
+      profile: $('#cProfile').value, adaptive: '1', desktop: $('#cDesktop').value,
+      name: current.name});
     window.open('/viewer?' + q + '#token=' + encodeURIComponent(d.token), '_blank');
     dlgConnect.close();
   } catch(e) { $('#cErr').textContent = e.message; }

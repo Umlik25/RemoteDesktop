@@ -1,10 +1,12 @@
 import unittest
+import time
 from types import SimpleNamespace
 from unittest import mock
 
 from PIL import Image
 
 from core.host_server import HostServer, Session, encode_jpeg
+from core.display import DisplayManager, best_mode
 
 
 class StreamSettingsTests(unittest.TestCase):
@@ -79,6 +81,78 @@ class StreamSettingsTests(unittest.TestCase):
         self.assertGreater(len(high_quality), len(low_quality))
         with Image.open(__import__("io").BytesIO(high_quality)) as image:
             self.assertEqual((120, 90), image.size)
+
+    def test_display_mode_prefers_client_aspect_ratio(self):
+        modes = [
+            {"width": 2560, "height": 1440, "refresh": 144},
+            {"width": 1920, "height": 1200, "refresh": 60},
+            {"width": 1920, "height": 1080, "refresh": 144},
+        ]
+
+        chosen = best_mode(modes, 3456, 2234)
+
+        self.assertEqual((1920, 1200), (chosen["width"], chosen["height"]))
+
+    def test_display_manager_is_safely_disabled_off_windows(self):
+        with mock.patch("core.display.IS_WIN", False):
+            manager = DisplayManager()
+        self.assertFalse(manager.available)
+
+    def test_frame_ack_tracks_browser_backlog_and_latency(self):
+        user = {"role": "owner", "profile": "dev", "max_fps": 60}
+        server, session = self.make_server(user)
+        session.sent_times.extend([(8, time.monotonic() - 0.04),
+                                   (9, time.monotonic() - 0.02)])
+
+        server._apply_frame_ack(session, {
+            "id": 9, "queue": 2, "decode_ms": 3.5,
+        })
+
+        self.assertEqual(9, session.last_ack_id)
+        self.assertEqual(2, session.client_queue)
+        self.assertEqual(3.5, session.client_decode_ms)
+        self.assertGreater(session.ack_latency_ms, 0)
+        self.assertEqual([], list(session.sent_times))
+
+
+class DisplayConfigTests(unittest.IsolatedAsyncioTestCase):
+    async def test_allowed_session_changes_and_restores_shared_display(self):
+        server = HostServer.__new__(HostServer)
+        user = {"role": "user", "profile": "dev", "max_fps": 60,
+                "allow_display": True}
+        session = Session(SimpleNamespace(), "viewer", user, "127.0.0.1", "LAN Direct")
+        manager = SimpleNamespace(
+            available=True,
+            current=lambda: {"width": 2560, "height": 1440, "refresh": 144},
+            modes=lambda: [{"width": 1920, "height": 1200, "refresh": 60}],
+            set_best=mock.Mock(return_value=(
+                True, {"width": 1920, "height": 1200, "refresh": 60}, None)),
+            restore=mock.Mock(return_value=True),
+        )
+        server.display = manager
+        server.capture = SimpleNamespace(restart=mock.Mock())
+        server.sessions = {session.sid: session}
+        server._display_owner = None
+
+        state, reasons = await server._apply_display_config(session, {
+            "desktop_mode": "client", "client_width": 3456, "client_height": 2234,
+        }, user)
+
+        self.assertEqual("client", state["mode"])
+        self.assertEqual(session.sid, server._display_owner)
+        self.assertTrue(any("1920×1200" in reason for reason in reasons))
+        manager.set_best.assert_called_once_with(3456, 2234)
+        server.capture.restart.assert_called_once()
+
+        await server._apply_display_config(session, {
+            "desktop_mode": "client", "client_width": 3456, "client_height": 2234,
+        }, user)
+        manager.set_best.assert_called_once_with(3456, 2234)
+        server.capture.restart.assert_called_once()
+
+        await server._release_display(session)
+        manager.restore.assert_called_once()
+        self.assertIsNone(server._display_owner)
 
 
 class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
