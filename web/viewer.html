@@ -8,18 +8,10 @@
 * { box-sizing:border-box; }
 body { margin:0; background:#000; color:var(--fg); font:13px "Segoe UI",system-ui,sans-serif; overflow:hidden; }
 #stage { position:fixed; inset:0; background:#000; }
-canvas {
+canvas#cv {
   width:100%; height:100%; display:block; object-fit:contain;
-  outline:none; background:#000;
+  outline:none; background:#000; cursor:none;
 }
-/* Курсор рисуем сами (в кадре его нет). В оконном режиме с вводом используется
-   родной CSS-курсор нужной формы; при захвате мыши и в режиме просмотра —
-   этот SVG-оверлей. */
-#remoteCursor {
-  position:fixed; left:0; top:0; z-index:18; pointer-events:none; display:none;
-  filter:drop-shadow(0 1px 2px rgba(0,0,0,.6)); will-change:transform;
-}
-#remoteCursor.blocked { opacity:.5; }
 #toolbar {
   position:fixed; top:0; left:50%; transform:translateX(-50%);
   display:flex; gap:6px; padding:6px 10px; background:rgba(14,17,23,.92);
@@ -60,7 +52,7 @@ button.danger { background:var(--err); border-color:var(--err); }
 </head>
 <body>
 <div id="msg"><h2 id="msgText">Подключение…</h2><div id="msgSub" style="color:#8b93a7;max-width:480px"></div></div>
-<div id="stage" style="display:none"><canvas id="cv" tabindex="0"></canvas><div id="remoteCursor"></div></div>
+<div id="stage" style="display:none"><canvas id="cv" tabindex="0"></canvas></div>
 
 <div id="toolbar" style="display:none">
   <button id="btnOverlay" class="acc" onclick="toggleOverlay()">📊 Оверлей</button>
@@ -75,7 +67,7 @@ button.danger { background:var(--err); border-color:var(--err); }
   <select id="selRes" onchange="sendConfig()" title="Разрешение потока"><option value="1">Разрешение…</option></select>
   <button id="btnInput" onclick="toggleInput()">⌨️ Ввод: вкл</button>
   <button id="btnKeys" onclick="toggleKeyMode()" title="Текст: печатает символы как есть (любая раскладка, точки, кириллица). Игра: клавиши как физические кнопки (WASD с удержанием).">⌨️ Набор: текст</button>
-  <button id="btnCapture" onclick="toggleCaptureMode()" title="Захват мыши: курсор не выходит за окно и не задевает меню/док Mac. Esc — освободить.">🔒 Захват</button>
+  <button id="btnCapture" onclick="toggleCaptureMode()" title="Захват мыши: курсор не выходит за окно и не задевает меню/док Mac. Выход: удерживайте Esc.">🔒 Захват</button>
   <button id="btnMac" onclick="toggleMac()" title="Раскладка Mac→Windows: клавиша ⌘ (Cmd) работает как Ctrl (⌘C = копировать и т.п.)">⌘→Ctrl</button>
   <button onclick="langSwitch()" title="Переключить язык ввода НА ХОСТЕ (Win+Space). Для набора текста обычно не нужно — печатайте в своей раскладке.">🌐</button>
   <button onclick="clipSend()" id="btnClipS" title="Отправить буфер обмена на хост">📋→</button>
@@ -92,7 +84,8 @@ const P = new URLSearchParams(location.search);
 const HOST = P.get('host'), PORT = P.get('port'), TOKEN = P.get('token');
 const $ = s => document.querySelector(s);
 const cv = $('#cv'), ctx = cv.getContext('2d');
-const remoteCursor = $('#remoteCursor');
+const base = document.createElement('canvas');       // содержимое экрана хоста
+const bctx = base.getContext('2d');
 const toolbar = $('#toolbar');
 const clamp = v => v < 0 ? 0 : v > 1 ? 1 : v;
 
@@ -107,13 +100,14 @@ let captured = false;       // сейчас Pointer Lock активен
 let macKeys = IS_MAC;       // Cmd -> Ctrl
 let keyMode = 'text';       // 'text' — Unicode-набор; 'game' — физические клавиши
 
-// адаптивный курсор хоста
+// курсор
 let hostCursorType = 'default', hostCursorVisible = true, hostCursorPos = {x:0, y:0};
-let vx = 0.5, vy = 0.5;     // виртуальная позиция курсора (0..1 по картинке)
+let vx = 0.5, vy = 0.5;     // виртуальная позиция курсора при захвате (0..1)
 let localMouse = {x: 0, y: 0}, localOver = false;   // реальная мышь (оконный режим)
 
 // метрики клиента
 let frames = 0, fpsShown = 0, bytesAcc = 0, bitrate = 0;
+let deltaCnt = 0, fullCnt = 0;
 let rtts = [], ping = 0, jitter = 0;
 let decodeMs = 0, frameGapMs = 0, lastFrameT = 0;
 let framesDropped = 0;
@@ -122,25 +116,86 @@ $('#selFps').value = P.get('fps') || '60';
 $('#selQ').value = P.get('quality') || '70';
 $('#selProfile').value = P.get('profile') || 'dev';
 
-// ------- SVG-курсоры для оверлея (захват / просмотр). hx,hy — «горячая точка».
-const CURSORS = {
-  'default':     {hx:2,  hy:2,  svg:'<svg width="20" height="24" viewBox="0 0 20 24"><path d="M2 2 L2 18 L6 14.5 L8.8 20.5 L11.4 19.3 L8.7 13.6 L13.5 13.6 Z" fill="#fff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/></svg>'},
-  'text':        {hx:7,  hy:13, svg:'<svg width="14" height="26" viewBox="0 0 14 26"><g fill="none" stroke-linecap="round"><path d="M7 3 V23 M4 3 H10 M4 23 H10" stroke="#111" stroke-width="3.6"/><path d="M7 3 V23 M4 3 H10 M4 23 H10" stroke="#fff" stroke-width="1.6"/></g></svg>'},
-  'pointer':     {hx:9,  hy:3,  svg:'<svg width="24" height="28" viewBox="0 0 24 28"><path d="M8 3 c-1.1 0-1.9 .9-1.9 2 V13 L4.7 12 c-.9-.7-2.2-.5-2.2 .8 0 .5 .2 .9 .6 1.3 l3.7 4.4 c1.1 1.4 2.3 2.3 4.5 2.3 h3 c2.1 0 3.6-1.5 3.6-3.6 V10 c0-.9-.7-1.6-1.6-1.6 -.3 0-.5 .1-.8 .2 -.1-.8-.7-1.4-1.6-1.4 -.4 0-.7 .1-1 .3 -.2-.8-.8-1.3-1.6-1.3 -.3 0-.6 .1-.9 .2 V5 C9.9 3.9 9.1 3 8 3 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
-  'move':        {hx:14, hy:14, svg:'<svg width="28" height="28" viewBox="0 0 28 28"><path d="M14 2 L18 6 H15.2 V12.8 H22 V10 L26 14 L22 18 V15.2 H15.2 V22 H18 L14 26 L10 22 H12.8 V15.2 H6 V18 L2 14 L6 10 V12.8 H12.8 V6 H10 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
-  'ew-resize':   {hx:14, hy:7,  svg:'<svg width="28" height="14" viewBox="0 0 28 14"><path d="M7 3 L2 7 L7 11 V8 H21 V11 L26 7 L21 3 V6 H7 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
-  'ns-resize':   {hx:7,  hy:14, svg:'<svg width="14" height="28" viewBox="0 0 14 28"><path d="M3 7 L7 2 L11 7 H8 V21 H11 L7 26 L3 21 H6 V7 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
-  'nwse-resize': {hx:12, hy:12, svg:'<svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 4 H12 L9.2 6.8 L17.2 14.8 L20 12 V20 H12 L14.8 17.2 L6.8 9.2 L4 12 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
-  'nesw-resize': {hx:12, hy:12, svg:'<svg width="24" height="24" viewBox="0 0 24 24"><path d="M20 4 H12 L14.8 6.8 L6.8 14.8 L4 12 V20 H12 L9.2 17.2 L17.2 9.2 L20 12 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
-  'crosshair':   {hx:12, hy:12, svg:'<svg width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke-linecap="round"><path d="M12 2 V22 M2 12 H22" stroke="#111" stroke-width="3.4"/><path d="M12 2 V22 M2 12 H22" stroke="#fff" stroke-width="1.4"/></g></svg>'},
-  'not-allowed': {hx:12, hy:12, svg:'<svg width="24" height="24" viewBox="0 0 24 24"><g fill="none"><circle cx="12" cy="12" r="9" stroke="#111" stroke-width="4.5"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4" stroke="#111" stroke-width="4.5"/><circle cx="12" cy="12" r="9" stroke="#f0564f" stroke-width="2.6"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4" stroke="#f0564f" stroke-width="2.6"/></g></svg>'},
+// ================== КУРСОР: рисуется ПРЯМО В CANVAS ==================
+// Никаких DOM-слоёв: курсор компонуется с кадром при отрисовке, поэтому он
+// не может пропасть из-за z-index/fullscreen/pointer-lock причуд браузера.
+const CURSOR_SVGS = {
+  'default':     {hx:2,  hy:2,  w:20, h:24, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="24" viewBox="0 0 20 24"><path d="M2 2 L2 18 L6 14.5 L8.8 20.5 L11.4 19.3 L8.7 13.6 L13.5 13.6 Z" fill="#fff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/></svg>'},
+  'text':        {hx:7,  hy:13, w:14, h:26, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="14" height="26" viewBox="0 0 14 26"><g fill="none" stroke-linecap="round"><path d="M7 3 V23 M4 3 H10 M4 23 H10" stroke="#111" stroke-width="3.6"/><path d="M7 3 V23 M4 3 H10 M4 23 H10" stroke="#fff" stroke-width="1.6"/></g></svg>'},
+  'pointer':     {hx:9,  hy:3,  w:24, h:28, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="28" viewBox="0 0 24 28"><path d="M8 3 c-1.1 0-1.9 .9-1.9 2 V13 L4.7 12 c-.9-.7-2.2-.5-2.2 .8 0 .5 .2 .9 .6 1.3 l3.7 4.4 c1.1 1.4 2.3 2.3 4.5 2.3 h3 c2.1 0 3.6-1.5 3.6-3.6 V10 c0-.9-.7-1.6-1.6-1.6 -.3 0-.5 .1-.8 .2 -.1-.8-.7-1.4-1.6-1.4 -.4 0-.7 .1-1 .3 -.2-.8-.8-1.3-1.6-1.3 -.3 0-.6 .1-.9 .2 V5 C9.9 3.9 9.1 3 8 3 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
+  'move':        {hx:14, hy:14, w:28, h:28, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28"><path d="M14 2 L18 6 H15.2 V12.8 H22 V10 L26 14 L22 18 V15.2 H15.2 V22 H18 L14 26 L10 22 H12.8 V15.2 H6 V18 L2 14 L6 10 V12.8 H12.8 V6 H10 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
+  'ew-resize':   {hx:14, hy:7,  w:28, h:14, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="28" height="14" viewBox="0 0 28 14"><path d="M7 3 L2 7 L7 11 V8 H21 V11 L26 7 L21 3 V6 H7 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
+  'ns-resize':   {hx:7,  hy:14, w:14, h:28, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="14" height="28" viewBox="0 0 14 28"><path d="M3 7 L7 2 L11 7 H8 V21 H11 L7 26 L3 21 H6 V7 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
+  'nwse-resize': {hx:12, hy:12, w:24, h:24, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M4 4 H12 L9.2 6.8 L17.2 14.8 L20 12 V20 H12 L14.8 17.2 L6.8 9.2 L4 12 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
+  'nesw-resize': {hx:12, hy:12, w:24, h:24, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M20 4 H12 L14.8 6.8 L6.8 14.8 L4 12 V20 H12 L9.2 17.2 L17.2 9.2 L20 12 Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>'},
+  'crosshair':   {hx:12, hy:12, w:24, h:24, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke-linecap="round"><path d="M12 2 V22 M2 12 H22" stroke="#111" stroke-width="3.4"/><path d="M12 2 V22 M2 12 H22" stroke="#fff" stroke-width="1.4"/></g></svg>'},
+  'not-allowed': {hx:12, hy:12, w:24, h:24, svg:'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none"><circle cx="12" cy="12" r="9" stroke="#111" stroke-width="4.5"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4" stroke="#111" stroke-width="4.5"/><circle cx="12" cy="12" r="9" stroke="#f0564f" stroke-width="2.6"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4" stroke="#f0564f" stroke-width="2.6"/></g></svg>'},
 };
-const CSS_CURSORS = new Set(['default','text','pointer','move','ew-resize','ns-resize',
-  'nwse-resize','nesw-resize','not-allowed','crosshair','wait','progress','help','grab','grabbing']);
-function cur(type) { return CURSORS[type] || CURSORS['default']; }
-function cssCursor(type) { return CSS_CURSORS.has(type) ? type : 'default'; }
+const cursorImgs = {};
+for (const [type, c] of Object.entries(CURSOR_SVGS)) {
+  const img = new Image();
+  img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(c.svg);
+  cursorImgs[type] = img;
+}
 function nativeWH() { return (hello && hello.screen) || [cv.width || 1, cv.height || 1]; }
+function contentRect() {
+  const r = cv.getBoundingClientRect();
+  if (!cv.width || !cv.height || !r.width || !r.height) return {x:r.left, y:r.top, w:r.width||1, h:r.height||1};
+  const ar = cv.width / cv.height, rr = r.width / r.height;
+  if (rr > ar) { const h = r.height, w = h * ar; return {x: r.left + (r.width - w) / 2, y: r.top, w, h}; }
+  const w = r.width, h = w / ar; return {x: r.left, y: r.top + (r.height - h) / 2, w, h};
+}
+// Позиция курсора в ПИКСЕЛЯХ CANVAS + видимость (по режиму)
+function cursorState() {
+  if (!cv.width) return {show:false, px:0, py:0};
+  if (captured) return {show:true, px: vx * cv.width, py: vy * cv.height};
+  if (inputEnabled) {
+    if (!localOver) return {show:false, px:0, py:0};
+    const c = contentRect();
+    return {show:true,
+            px: clamp((localMouse.x - c.x) / c.w) * cv.width,
+            py: clamp((localMouse.y - c.y) / c.h) * cv.height};
+  }
+  const [nw, nh] = nativeWH();
+  return {show: hostCursorVisible,
+          px: clamp(hostCursorPos.x / nw) * cv.width,
+          py: clamp(hostCursorPos.y / nh) * cv.height};
+}
+let dirty = false, lastDrawKey = '';
+function renderLoop() {
+  const st = cursorState();
+  const blocked = !permissions.input || !inputEnabled;
+  const key = [st.show, Math.round(st.px), Math.round(st.py), hostCursorType, blocked, captured].join('|');
+  if ((dirty || key !== lastDrawKey) && cv.width && base.width) {
+    ctx.drawImage(base, 0, 0);
+    if (st.show) {
+      const c = CURSOR_SVGS[hostCursorType] || CURSOR_SVGS['default'];
+      const img = cursorImgs[hostCursorType] || cursorImgs['default'];
+      // курсор всегда ~одного видимого размера: масштаб = px канваса на CSS px
+      const cr = contentRect();
+      const k = Math.max(0.6, Math.min(4, cv.width / cr.w));
+      ctx.save();
+      if (blocked && !captured) ctx.globalAlpha = 0.55;
+      if (img.complete && img.naturalWidth) {
+        ctx.drawImage(img, st.px - c.hx * k, st.py - c.hy * k, c.w * k, c.h * k);
+      } else {   // фолбэк, пока SVG не декодировался: простая стрелка
+        ctx.beginPath();
+        ctx.moveTo(st.px, st.py); ctx.lineTo(st.px, st.py + 16 * k);
+        ctx.lineTo(st.px + 11 * k, st.py + 11 * k); ctx.closePath();
+        ctx.fillStyle = '#fff'; ctx.strokeStyle = '#111'; ctx.lineWidth = k;
+        ctx.fill(); ctx.stroke();
+      }
+      ctx.restore();
+    }
+    lastDrawKey = key; dirty = false;
+  }
+  requestAnimationFrame(renderLoop);
+}
+requestAnimationFrame(renderLoop);
 
+// ================== ПОТОК: дельта-кадры ==================
+// Бинарное сообщение: [0xA7, ver, kind(0=full,1=delta), 0, x:u16, y:u16,
+// fw:u16, fh:u16] (little-endian) + JPEG. Дельта рисуется поверх base в (x,y).
 function connect() {
   ws = new WebSocket(`ws://${HOST}:${PORT}/ws/stream?token=${encodeURIComponent(TOKEN)}`);
   ws.binaryType = 'arraybuffer';
@@ -165,25 +220,51 @@ function hint(text, ttl) {
   if (ttl) hintTimer = setTimeout(() => { h.style.display = 'none'; }, ttl);
 }
 
-// ---- декодирование: держим только самый свежий кадр, старые отбрасываем.
-let pendingFrame = null, decoding = false;
+// Очередь кадров: дельты терять нельзя (каждая строится на предыдущей).
+// Если декодер безнадёжно отстал — очищаем очередь и просим полный кадр.
+let frameQueue = [], decoding = false;
 function onMsg(e) {
   if (typeof e.data === 'string') { onText(JSON.parse(e.data)); return; }
   bytesAcc += e.data.byteLength;
-  if (pendingFrame) framesDropped++;
-  pendingFrame = e.data;
+  const dv = new DataView(e.data);
+  let item;
+  if (e.data.byteLength > 12 && dv.getUint8(0) === 0xA7 && dv.getUint8(1) === 1) {
+    item = {kind: dv.getUint8(2), x: dv.getUint16(4, true), y: dv.getUint16(6, true),
+            fw: dv.getUint16(8, true), fh: dv.getUint16(10, true),
+            buf: e.data.slice(12)};
+  } else {
+    item = {kind: 0, x: 0, y: 0, fw: 0, fh: 0, buf: e.data};   // legacy: целый JPEG
+  }
+  frameQueue.push(item);
+  if (frameQueue.length > 8) {          // декодер не успевает — начать заново
+    framesDropped += frameQueue.length;
+    frameQueue = [];
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'refresh'}));
+    return;
+  }
   if (!decoding) drainFrames();
 }
 async function drainFrames() {
   decoding = true;
-  while (pendingFrame) {
-    const buf = pendingFrame; pendingFrame = null;
+  while (frameQueue.length) {
+    const f = frameQueue.shift();
     const t0 = performance.now();
     try {
-      const bmp = await createImageBitmap(new Blob([buf], {type:'image/jpeg'}));
-      if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
-      ctx.drawImage(bmp, 0, 0);
+      const bmp = await createImageBitmap(new Blob([f.buf], {type:'image/jpeg'}));
+      const fw = f.fw || bmp.width, fh = f.fh || bmp.height;
+      if (base.width !== fw || base.height !== fh) {
+        base.width = fw; base.height = fh;
+        cv.width = fw; cv.height = fh;
+        if (f.kind === 1) {   // дельта при несовпадении размера — нужен полный
+          bmp.close();
+          if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'refresh'}));
+          continue;
+        }
+      }
+      bctx.drawImage(bmp, f.x, f.y);
       bmp.close();
+      if (f.kind === 1) deltaCnt++; else fullCnt++;
+      dirty = true;
       decodeMs = performance.now() - t0;
       if (lastFrameT) frameGapMs = t0 - lastFrameT;
       lastFrameT = t0;
@@ -205,7 +286,6 @@ async function onText(d) {
     keyMode = ($('#selProfile').value === 'game' || $('#selProfile').value === 'competitive') ? 'game' : 'text';
     updateCaptureButton(); updateMacButton(); updateKeysButton();
     buildResSelect();
-    updateCursorMode();
     cv.focus();
     pokeToolbar();
     renderOverlay();
@@ -223,10 +303,9 @@ async function onText(d) {
     if (d.permissions) applyPermissions(d.permissions);
   } else if (d.type === 'cursor') {
     const c = d.cursor || {};
-    if (c.type && c.type !== hostCursorType) { hostCursorType = c.type; updateCursorMode(); }
+    if (c.type) hostCursorType = c.type;
     if (typeof c.x === 'number') { hostCursorPos.x = c.x; hostCursorPos.y = c.y; }
     hostCursorVisible = c.visible !== false;
-    if (!captured && !inputEnabled) updateCursorMode();   // просмотр: курсор ведёт хост
   } else if (d.type === 'clipboard') {
     try { await navigator.clipboard.writeText(d.text); } catch(_){}
   } else if (d.type === 'kick') {
@@ -252,17 +331,20 @@ function renderOverlay() {
   const inputWarn = permissions.input ? '' : `<div class="e">${inputReasonText()}</div>`;
   const inputLat = ping ? (ping / 2 + frameGapMs / 2).toFixed(0) : '—';
   const modeTxt = captured ? 'захват мыши' : (inputEnabled ? 'оконный' : 'просмотр');
+  const total = deltaCnt + fullCnt;
+  const deltaShare = total ? Math.round(deltaCnt * 100 / total) : 0;
   ov.innerHTML = `
     <span class="badge ${routeCls}">${route}</span> <b>${hello ? hello.host_name : ''}</b>
     <div class="sec">ПОТОК</div>
     FPS: <b>${fpsShown}</b> (цель ${s.fps_target ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
-    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>${s.codec || 'MJPEG'}</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI (быстрый)' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
+    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>MJPEG-дельта</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
     Поток: <b>${cv.width}×${cv.height}</b> · Мой экран: <b>${Math.round(screen.width*(devicePixelRatio||1))}×${Math.round(screen.height*(devicePixelRatio||1))}</b><br>
+    Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>
     Профиль: <b>${sess.profile || $('#selProfile').value}</b> · Q${s.quality ?? '—'} · Режим: <b>${modeTxt}</b> · Набор: <b>${keyMode === 'text' ? 'текст' : 'игра'}</b>
     <div class="sec">ЗАДЕРЖКИ</div>
     Ping: <b>${ping.toFixed(1)} мс</b> · Jitter: <b>${jitter.toFixed(1)} мс</b><br>
     Ввод (оценка): <b>~${inputLat} мс</b> · Декодирование: <b>${decodeMs.toFixed(1)} мс</b><br>
-    Пропущено декодером: <b>${framesDropped}</b> <span style="color:#8b93a7">(показывается только самый свежий кадр)</span>
+    Отброшено кадров: <b>${framesDropped}</b>
     <div class="sec">ХОСТ</div>
     CPU: <b>${h.cpu_percent ?? '—'}%</b> · RAM: <b>${h.ram_percent ?? '—'}%</b><br>
     GPU: <b>${h.gpu_percent ?? 'н/д'}%</b> · VRAM: <b>${h.vram_percent ?? 'н/д'}%</b>
@@ -296,7 +378,8 @@ function buildResSelect() {
   }
   const want = P.get('scale') || 'auto';
   if (want === 'auto') {
-    // 1440p/4K в MJPEG — десятки Мбит/с; для плавности стартуем с 1080p
+    // дельта-кадры сильно снижают трафик, но полные кадры 1440p/4K всё ещё
+    // тяжёлые — для плавности стартуем с 1080p
     let v = '1';
     if (nh > 1200) {
       const o = [...sel.options].find(o => /×1080$/.test(o.textContent));
@@ -318,7 +401,7 @@ function toggleInput() {
   inputEnabled = !inputEnabled;
   if (!inputEnabled) exitCapture();
   updateInputButton();
-  updateCursorMode();
+  dirty = true;
 }
 function toggleFs() {
   if (document.fullscreenElement) exitCapture();
@@ -329,12 +412,10 @@ function disconnect() { exitCapture(); if (ws) ws.close(); showMsg('Отключ
 
 // -------- захват мыши --------
 // Захват = полный экран + Pointer Lock + Keyboard Lock. Полный экран нужен,
-// чтобы Keyboard Lock отдавал Esc НА ХОСТ (а не сбрасывал захват) — это и есть
-// тот приём, которым решают проблему браузерные клиенты облачного гейминга.
-// Тап по Esc уходит в Windows; чтобы выйти — УДЕРЖИТЕ Esc (браузер сам выйдет
-// из полноэкранного режима) или кнопкой «Захват». Где Keyboard Lock не
-// поддерживается (Safari) — Esc всё равно уходит на хост, а захват сам
-// возвращается следующим кликом.
+// чтобы Keyboard Lock отдавал Esc НА ХОСТ (а не сбрасывал захват) — приём
+// браузерных клиентов облачного гейминга. Тап по Esc уходит в Windows; выход —
+// УДЕРЖАТЬ Esc или кнопка «Захват». Без Keyboard Lock (Safari) Esc снимает
+// захват, следующий клик возвращает.
 let kbLocked = false, kbSupported = !!(navigator.keyboard && navigator.keyboard.lock);
 function kbLock() {
   if (kbLocked || !kbSupported) return;
@@ -393,12 +474,12 @@ document.addEventListener('pointerlockchange', () => {
   } else {
     releaseAll(); pokeToolbar();
   }
-  updateCursorMode();
+  dirty = true;
 });
 document.addEventListener('pointerlockerror', () => {
   // не удалось захватить — не «съедаем» клики, работаем в оконном режиме
   captureMode = false; captured = false;
-  updateCaptureButton(); updateCursorMode();
+  updateCaptureButton(); dirty = true;
   hint('Захват мыши недоступен в этом браузере — оконный режим', 4000);
 });
 function updateCaptureButton() {
@@ -428,7 +509,7 @@ function applyPermissions(next) {
   permissions = {...permissions, ...next};
   if (!hadInput && permissions.input) inputEnabled = true;
   updateInputButton();
-  updateCursorMode();
+  dirty = true;
 }
 function inputReasonText() {
   const r = permissions.input_reason;
@@ -451,44 +532,6 @@ function updateInputButton() {
     btn.title = permissions.work_only_mode ? 'Рабочий режим хоста включён, но ввод разрешён.' : '';
     btn.textContent = '⌨️ Ввод: ' + (inputEnabled ? 'вкл' : 'выкл');
   }
-}
-
-// -------- отрисовка курсора --------
-function contentRect() {
-  const r = cv.getBoundingClientRect();
-  if (!cv.width || !cv.height || !r.width || !r.height) return {x:r.left, y:r.top, w:r.width||1, h:r.height||1};
-  const ar = cv.width / cv.height, rr = r.width / r.height;
-  if (rr > ar) { const h = r.height, w = h * ar; return {x: r.left + (r.width - w) / 2, y: r.top, w, h}; }
-  const w = r.width, h = w / ar; return {x: r.left, y: r.top + (r.height - h) / 2, w, h};
-}
-function cursorClientPos() {
-  const c = contentRect();
-  if (captured) return {x: c.x + vx * c.w, y: c.y + vy * c.h};
-  if (inputEnabled) return {x: localMouse.x, y: localMouse.y};   // оконный: реальная мышь
-  const [nw, nh] = nativeWH();   // просмотр: позиция от хоста (в родных координатах)
-  return {x: c.x + clamp(hostCursorPos.x / nw) * c.w, y: c.y + clamp(hostCursorPos.y / nh) * c.h};
-}
-function renderRemoteCursor() {
-  const c = cur(hostCursorType);
-  if (remoteCursor.dataset.type !== hostCursorType) {
-    remoteCursor.innerHTML = c.svg; remoteCursor.dataset.type = hostCursorType;
-  }
-  const p = cursorClientPos();
-  remoteCursor.style.transform = `translate(${p.x - c.hx}px, ${p.y - c.hy}px)`;
-}
-function updateCursorMode() {
-  cv.style.cursor = 'none';                       // родной прячем — рисуем свой
-  const blocked = !permissions.input || !inputEnabled;
-  remoteCursor.classList.toggle('blocked', blocked && !captured);
-  // Когда управляем мы (захват/оконный) — курсор виден ВСЕГДА и не зависит от
-  // флага «показан ли курсор» на хосте (иначе он мигал/пропадал). В просмотре
-  // повторяем состояние хоста.
-  let show;
-  if (captured) show = true;
-  else if (inputEnabled) show = localOver;
-  else show = hostCursorVisible;
-  remoteCursor.style.display = show ? '' : 'none';
-  if (show) renderRemoteCursor();
 }
 
 function sendConfig() {
@@ -530,7 +573,6 @@ function flushNow() {
 setInterval(flushNow, 8);
 
 function pushMove(x, y) {
-  vx = x; vy = y;
   const last = evQueue[evQueue.length - 1];
   if (last && last.t === 'mm') { last.x = x; last.y = y; }
   else evQueue.push({t:'mm', x, y});
@@ -550,23 +592,13 @@ cv.addEventListener('mousemove', e => {
     vx = clamp(vx + e.movementX / c.w);
     vy = clamp(vy + e.movementY / c.h);
     if (inputEnabled) pushMove(vx, vy);
-    renderRemoteCursor();
   } else if (inputEnabled) {
-    if (insideContent(e)) {
-      localMouse.x = e.clientX; localMouse.y = e.clientY; localOver = true;
-      const p = normAbs(e);
-      pushMove(p.x, p.y);
-      remoteCursor.style.display = '';
-      renderRemoteCursor();
-    } else if (localOver) {
-      localOver = false;
-      remoteCursor.style.display = 'none';
-    }
+    localMouse.x = e.clientX; localMouse.y = e.clientY;
+    localOver = insideContent(e);
+    if (localOver) { const p = normAbs(e); pushMove(p.x, p.y); }
   }
 });
-cv.addEventListener('mouseleave', () => {
-  if (!captured) { localOver = false; remoteCursor.style.display = 'none'; }
-});
+cv.addEventListener('mouseleave', () => { if (!captured) localOver = false; });
 cv.addEventListener('mousedown', e => {
   e.preventDefault(); cv.focus();
   if (captureMode && !captured && permissions.input && inputEnabled) {

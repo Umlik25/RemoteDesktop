@@ -10,11 +10,13 @@ MVP-ограничения (честно):
 - Трафик не шифруется TLS в MVP — использовать в доверенной LAN.
 """
 import asyncio
+import collections
 import concurrent.futures
 import io
 import ipaddress
 import json
 import socket
+import struct
 import time
 import uuid
 
@@ -39,12 +41,18 @@ try:
 except Exception:
     DXCAM_OK = False
 
+# numpy — для дельта-кадров (поиск изменённой области экрана).
+try:
+    import numpy as np
+    NP_OK = True
+except Exception:
+    NP_OK = False
+
 # Быстрое кодирование: OpenCV (libjpeg-turbo, SIMD) кодирует JPEG в 3–5 раз
 # быстрее Pillow — на 1440p это разница между ~20 и 60+ FPS. Fallback — Pillow.
 try:
-    import numpy as np
     import cv2
-    CV2_OK = True
+    CV2_OK = NP_OK
 except Exception:
     CV2_OK = False
 
@@ -139,12 +147,43 @@ _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 # ---------------------------------------------------------------- захват экрана
 
-class ScreenCapture:
-    """Отдельный поток захвата: хранит последний сырой кадр.
+def _bbox_pad(x0, y0, x1, y1, w, h):
+    """Расширить область на 8 px и выровнять по чётным координатам (JPEG 4:2:0)."""
+    x0 = max(0, x0 - 8) // 2 * 2
+    y0 = max(0, y0 - 8) // 2 * 2
+    x1 = min(w, ((x1 + 8 + 1) // 2) * 2)
+    y1 = min(h, ((y1 + 8 + 1) // 2) * 2)
+    return (int(x0), int(y0), int(x1), int(y1))
 
-    seq растёт только когда содержимое экрана реально изменилось
-    (memcmp предыдущего кадра) — статичный экран не кодируется и не шлётся,
-    что убирает лишнюю нагрузку CPU и трафик."""
+
+def _diff_bbox(a, b):
+    """Прямоугольник изменений между кадрами (H, W, 4).
+
+    False — кадры идентичны; None — считать изменённым целиком (ошибка/resize).
+    Это ядро дельта-кадров: передаётся только изменившаяся область экрана."""
+    try:
+        if a.shape != b.shape:
+            return None
+        h, w = b.shape[:2]
+        rows = (a.reshape(h, -1) != b.reshape(h, -1)).any(axis=1)
+        idx = np.flatnonzero(rows)
+        if idx.size == 0:
+            return False
+        y0, y1 = int(idx[0]), int(idx[-1]) + 1
+        cols = (a[y0:y1] != b[y0:y1]).any(axis=(0, 2))
+        ci = np.flatnonzero(cols)
+        x0, x1 = int(ci[0]), int(ci[-1]) + 1
+        return _bbox_pad(x0, y0, x1, y1, w, h)
+    except Exception:
+        return None
+
+
+class ScreenCapture:
+    """Отдельный поток захвата: хранит последний сырой кадр + область изменений.
+
+    seq растёт только когда содержимое экрана реально изменилось; для каждого
+    кадра запоминается bbox изменений (кольцо bbox_ring) — отправители шлют
+    клиентам только изменённые области (дельта-кадры)."""
 
     def __init__(self):
         self.frame = None          # (bytes BGRA, width, height, ts, seq)
@@ -153,6 +192,7 @@ class ScreenCapture:
         self.mon_offset = (0, 0)   # left/top захватываемого монитора
         self.backend = None        # "dxgi" | "gdi"
         self.on_frame = None       # колбэк «появился новый кадр» (из потока захвата)
+        self.bbox_ring = collections.deque(maxlen=600)   # (seq, bbox|None)
         self._thread = None
 
     def start(self):
@@ -165,6 +205,37 @@ class ScreenCapture:
 
     def stop(self):
         self.running = False
+
+    def bbox_since(self, since_seq, upto_seq):
+        """Объединённая область изменений за (since_seq, upto_seq].
+        None — данных не хватает (или был полный кадр) → слать полный кадр."""
+        if upto_seq <= since_seq:
+            return None
+        try:
+            ring = list(self.bbox_ring)   # снапшот: поток захвата дописывает
+        except RuntimeError:
+            return None
+        boxes = {}
+        for s, b in reversed(ring):
+            if s <= since_seq:
+                break
+            boxes[s] = b
+        x0 = y0 = 1 << 30
+        x1 = y1 = -1
+        for s in range(since_seq + 1, upto_seq + 1):
+            b = boxes.get(s, "missing")
+            if b == "missing" or b is None:
+                return None
+            x0 = min(x0, b[0]); y0 = min(y0, b[1])
+            x1 = max(x1, b[2]); y1 = max(y1, b[3])
+        return (x0, y0, x1, y1) if x1 > x0 else None
+
+    def _publish(self, arr, w, h, seq, bbox):
+        self.bbox_ring.append((seq, bbox))
+        self.frame = (arr if isinstance(arr, bytes) else arr.tobytes(),
+                      w, h, time.time(), seq)
+        if self.on_frame:
+            self.on_frame()
 
     def _loop(self):
         if DXCAM_OK and self._loop_dxcam():
@@ -185,6 +256,7 @@ class ScreenCapture:
         self.mon_offset = (0, 0)   # dxcam захватывает основной монитор с (0,0)
         seq = 0
         errors = 0
+        prev = None
         try:
             while self.running:
                 t0 = time.perf_counter()
@@ -199,11 +271,12 @@ class ScreenCapture:
                     time.sleep(0.05)
                     continue
                 if f is not None:
-                    seq += 1
-                    h, w = f.shape[:2]
-                    self.frame = (f.tobytes(), w, h, time.time(), seq)
-                    if self.on_frame:
-                        self.on_frame()
+                    bbox = _diff_bbox(prev, f) if (prev is not None and NP_OK) else None
+                    prev = f
+                    if bbox is not False:    # False = кадры идентичны, пропускаем
+                        seq += 1
+                        h, w = f.shape[:2]
+                        self._publish(f, w, h, seq, bbox)
                 dt = time.perf_counter() - t0
                 time.sleep(max(0.001, 1.0 / max(self.max_fps, 1) - dt))
         finally:
@@ -227,11 +300,15 @@ class ScreenCapture:
                     img = sct.grab(mon)
                     raw = img.bgra
                     if prev is None or raw != prev:   # memcmp: быстрый, с ранним выходом
-                        seq += 1
-                        self.frame = (raw, img.width, img.height, time.time(), seq)
+                        bbox = None
+                        if prev is not None and NP_OK:
+                            a = np.frombuffer(prev, np.uint8).reshape(img.height, img.width, 4)
+                            b = np.frombuffer(raw, np.uint8).reshape(img.height, img.width, 4)
+                            bbox = _diff_bbox(a, b)
                         prev = raw
-                        if self.on_frame:
-                            self.on_frame()
+                        if bbox is not False:
+                            seq += 1
+                            self._publish(raw, img.width, img.height, seq, bbox)
                 except Exception:
                     time.sleep(0.5)
                     continue
@@ -240,29 +317,49 @@ class ScreenCapture:
                 time.sleep(delay)
 
 
-def encode_jpeg(frame, quality, scale):
+def encode_jpeg(frame, quality, scale, region=None):
+    """JPEG кадра или его области.
+
+    region=(x0,y0,x1,y1) в координатах кадра — кодируется только эта область
+    (дельта-кадр). Возвращает (data, sx, sy, fw, fh): смещение области и полные
+    размеры потока в МАСШТАБИРОВАННЫХ координатах."""
     raw, w, h, ts, seq = frame
+    if scale < 0.999:
+        fw = max(2, int(w * scale)) // 2 * 2
+        fh = max(2, int(h * scale)) // 2 * 2
+    else:
+        fw, fh = w, h
+    if region is None:
+        x0, y0, x1, y1 = 0, 0, w, h
+        sx = sy = 0
+        sw, sh = fw, fh
+    else:
+        x0, y0, x1, y1 = region
+        sx = int(x0 * fw / w) // 2 * 2
+        sy = int(y0 * fh / h) // 2 * 2
+        ex = min(fw, ((-(-(x1 * fw) // w)) + 1) // 2 * 2)   # ceil, чётное
+        ey = min(fh, ((-(-(y1 * fh) // h)) + 1) // 2 * 2)
+        sw, sh = max(2, int(ex - sx)), max(2, int(ey - sy))
     if CV2_OK:
         try:
-            arr = np.frombuffer(raw, np.uint8).reshape(h, w, 4)
+            arr = np.frombuffer(raw, np.uint8).reshape(h, w, 4)[y0:y1, x0:x1]
             if scale < 0.999:
-                nw = max(2, int(w * scale)) // 2 * 2
-                nh = max(2, int(h * scale)) // 2 * 2
-                arr = cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_AREA)
-            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+                arr = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
+            bgr = cv2.cvtColor(np.ascontiguousarray(arr), cv2.COLOR_BGRA2BGR)
             ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
             if ok:
-                return buf.tobytes(), bgr.shape[1], bgr.shape[0], ts
+                return buf.tobytes(), sx, sy, fw, fh
         except Exception:
             pass
     img = Image.frombytes("RGB", (w, h), raw, "raw", "BGRX")
+    if region is not None:
+        img = img.crop((x0, y0, x1, y1))
     if scale < 0.999:
-        img = img.resize((max(2, int(w * scale)) // 2 * 2,
-                          max(2, int(h * scale)) // 2 * 2), _BILINEAR)
+        img = img.resize((sw, sh), _BILINEAR)
     buf = io.BytesIO()
     # subsampling=2 (4:2:0) — заметно меньше и быстрее при том же видимом качестве
     img.save(buf, "JPEG", quality=int(quality), subsampling=2)
-    return buf.getvalue(), img.width, img.height, ts
+    return buf.getvalue(), sx, sy, fw, fh
 
 
 # ---------------------------------------------------------------- ввод
@@ -420,6 +517,7 @@ class Session:
         self.scale = base["scale"]
         self.degrade = 0           # 0..4 — ступень деградации по нагрузке хоста
         self.net_degrade = 0       # 0..3 — деградация из-за пропускной способности сети
+        self.force_full = True     # следующий кадр — полный (первый / по запросу клиента)
         self.priority = user.get("priority", "normal")
         self.frames = 0
         self.bytes = 0
@@ -671,15 +769,15 @@ class HostServer:
         targets = [self._stream_params(s)[0] for s in self.sessions.values()]
         self.capture.max_fps = max(targets, default=30)
 
-    async def _encoded(self, frame, quality, scale):
-        """Кодирование с общим кэшем: один и тот же кадр с одинаковыми
+    async def _encoded(self, frame, quality, scale, region=None):
+        """Кодирование с общим кэшем: один и тот же кадр/область с одинаковыми
         параметрами кодируется один раз на все сессии."""
-        key = (frame[4], int(quality), round(scale, 2))
+        key = (frame[4], int(quality), round(scale, 2), region)
         fut = self._enc_jobs.get(key)
         if fut is None:
             loop = asyncio.get_running_loop()
             fut = asyncio.ensure_future(
-                loop.run_in_executor(_executor, encode_jpeg, frame, quality, scale))
+                loop.run_in_executor(_executor, encode_jpeg, frame, quality, scale, region))
             # держим только задания текущего кадра
             self._enc_jobs = {k: v for k, v in self._enc_jobs.items() if k[0] >= frame[4]}
             self._enc_jobs[key] = fut
@@ -1001,6 +1099,10 @@ class HostServer:
                         sess.profile = d["profile"]
                     sess.net_degrade = 0   # пользователь сменил настройки — начинаем заново
                     self._refresh_capture_fps()
+                elif t == "refresh":
+                    # клиент просит полный кадр (потерял дельта-цепочку)
+                    sess.force_full = True
+                    self._notify_frame()
                 elif t == "input":
                     current_user = auth.get_user(username) or user
                     if self._input_permission(current_user)[0]:
@@ -1027,12 +1129,17 @@ class HostServer:
         return ws
 
     async def _frame_sender(self, sess):
-        """Отправка кадров: пропускает неизменённые, держит целевой FPS и
-        адаптируется к каналу (если сеть не успевает — ступени деградации:
-        битрейт → FPS → разрешение, с восстановлением)."""
+        """Отправка кадров: ДЕЛЬТА-КАДРЫ (только изменённые области экрана) —
+        это радикально снижает битрейт и задержку по Wi-Fi. Полный кадр идёт
+        при подключении, смене параметров, запросе клиента и раз в ~5 с после
+        дельт (заживление возможных швов). Бинарный формат:
+        12-байтовый заголовок [A7, ver, kind(0=full/1=delta), 0, x, y, fw, fh] + JPEG.
+        Адаптация к каналу: резкий затык → мгновенная ступень деградации."""
         last_seq = -1
         last_params = None
         last_pick = 0.0            # monotonic-время выбора последнего кадра
+        last_full_t = 0.0
+        dirty_since_full = False
         send_ewma = 0.0
         last_adapt = time.monotonic()
         while not sess.ws.closed:
@@ -1042,46 +1149,64 @@ class HostServer:
             frame = self.capture.frame
             now = time.monotonic()
             params = (int(quality), round(scale, 2))
-            # изменение = новый кадр экрана / смена настроек; курсор в кадр не
-            # впечатывается (его рисует клиент), поэтому темп задают только
-            # реальные изменения экрана и выбранный FPS. Раз в 2 с — keepalive.
+            heal = dirty_since_full and now - last_full_t >= 5.0
             changed = frame is not None and (
-                frame[4] != last_seq or params != last_params or now - last_pick >= 2.0)
+                frame[4] != last_seq or params != last_params
+                or sess.force_full or heal)
             if not changed or now < last_pick + budget * 0.75:
                 # Ждём СОБЫТИЕ нового кадра, а не таймер: системный таймер
-                # Windows тикает ~15.6 мс и таймерный пейсинг режет FPS вдвое;
-                # call_soon_threadsafe будит цикл мгновенно.
+                # Windows тикает ~15.6 мс и таймерный пейсинг режет FPS вдвое.
                 if ev is None:
                     await asyncio.sleep(0.05)
                 else:
                     try:
-                        await asyncio.wait_for(ev.wait(), timeout=0.05)
+                        await asyncio.wait_for(ev.wait(), timeout=0.25)
                     except asyncio.TimeoutError:
                         pass
                 continue
             last_pick = now
+            region = None
+            if (not sess.force_full and not heal
+                    and params == last_params and last_seq >= 0):
+                region = self.capture.bbox_since(last_seq, frame[4])
+                if region is not None:
+                    x0, y0, x1, y1 = region
+                    # область почти во весь экран — полный кадр проще и не хуже
+                    if (x1 - x0) * (y1 - y0) > 0.6 * frame[1] * frame[2]:
+                        region = None
             try:
-                data, w, h, ts = await self._encoded(frame, quality, scale)
+                data, sx, sy, fw, fh = await self._encoded(frame, quality, scale, region)
             except Exception:
                 await asyncio.sleep(0.1)
                 continue
+            kind = 1 if region is not None else 0
+            msg = struct.pack("<BBBBHHHH", 0xA7, 1, kind, 0, sx, sy, fw, fh) + data
             last_seq, last_params = frame[4], params
+            sess.force_full = False
+            if kind == 0:
+                last_full_t = now
+                dirty_since_full = False
+            else:
+                dirty_since_full = True
             t0 = time.perf_counter()
             try:
-                await sess.ws.send_bytes(data)
+                await sess.ws.send_bytes(msg)
             except (ConnectionError, RuntimeError):
                 break
             send_dt = time.perf_counter() - t0
             send_ewma = send_dt if not send_ewma else send_ewma * 0.7 + send_dt * 0.3
             now2 = time.monotonic()
-            if send_ewma > budget * 1.4 and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
+            if send_dt > max(0.25, budget * 4) and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
+                sess.net_degrade += 1      # резкий затык канала — реагируем сразу
+                last_adapt = now2
+            elif send_ewma > budget * 1.4 and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
                 sess.net_degrade += 1
                 last_adapt = now2
             elif send_ewma < budget * 0.4 and sess.net_degrade > 0 and now2 - last_adapt > 6.0:
                 sess.net_degrade -= 1
                 last_adapt = now2
             sess.frames += 1
-            sess.bytes += len(data)
+            sess.bytes += len(msg)
             nowt = time.time()
             if nowt - sess.last_bytes_ts >= 1.0:
                 sess.bitrate_mbps = sess.bytes * 8 / 1e6 / (nowt - sess.last_bytes_ts)
