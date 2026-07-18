@@ -174,6 +174,16 @@ class DisplayManager:
         if not self.available:
             return False, "Смена системного разрешения доступна только на Windows-хосте"
         with self._lock:
+            # Никогда не превышаем исходный режим монитора. GPU отдаёт режимы
+            # (вплоть до 1080p), которые физический монитор — особенно по
+            # VGA/D-SUB — не синхронизирует («вне диапазона»); CDS_TEST это не
+            # ловит (видеокарта режим поддерживает). Исходный режим заведомо
+            # отображается, поэтому он — безопасный потолок.
+            orig = self._original or {}
+            ow, oh = orig.get("width"), orig.get("height")
+            if ow and oh and (int(width) > ow or int(height) > oh):
+                return False, (f"{width}×{height} превышает исходный режим монитора "
+                               f"{ow}×{oh} — не переключаю, чтобы не выйти за диапазон")
             current = self.current() or {}
             mode = self._find_devmode(int(width), int(height), refresh or current.get("refresh", 0))
             if mode is None:
@@ -190,7 +200,13 @@ class DisplayManager:
             return True, None
 
     def set_best(self, target_width, target_height):
-        chosen = best_mode(self.modes(), int(target_width), int(target_height))
+        # Рассматриваем только режимы не крупнее исходного (проверенно-рабочего)
+        # режима монитора — иначе рискуем выставить то, что монитор не покажет.
+        orig = self._original or {}
+        ow = orig.get("width", 1 << 30)
+        oh = orig.get("height", 1 << 30)
+        safe = [m for m in self.modes() if m["width"] <= ow and m["height"] <= oh]
+        chosen = best_mode(safe, int(target_width), int(target_height))
         if not chosen:
             return False, None, "Поддерживаемые режимы дисплея не найдены"
         ok, error = self.set_mode(chosen["width"], chosen["height"], chosen.get("refresh", 0))

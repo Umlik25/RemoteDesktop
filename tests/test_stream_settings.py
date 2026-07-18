@@ -98,6 +98,41 @@ class StreamSettingsTests(unittest.TestCase):
             manager = DisplayManager()
         self.assertFalse(manager.available)
 
+    def test_set_best_never_exceeds_original_monitor_mode(self):
+        # Монитор по D-SUB не синхронизирует режимы крупнее исходного, даже если
+        # GPU их отдаёт — set_best обязан оставаться в пределах исходного режима.
+        mgr = DisplayManager.__new__(DisplayManager)
+        mgr._lock = __import__("threading").RLock()
+        mgr._mode_cache = [
+            {"width": 1920, "height": 1080, "refresh": 60, "bpp": 32},
+            {"width": 1280, "height": 720, "refresh": 60, "bpp": 32},
+            {"width": 1366, "height": 768, "refresh": 60, "bpp": 32},
+        ]
+        mgr._original = {"width": 1366, "height": 768, "refresh": 60, "bpp": 32}
+        requested = {}
+
+        def fake_set_mode(width, height, refresh=0):
+            requested["wh"] = (width, height)
+            return True, None
+
+        mgr.set_mode = fake_set_mode
+        ok, chosen, error = mgr.set_best(3456, 2234)   # огромный Retina-ноутбук
+
+        self.assertTrue(ok, error)
+        self.assertLessEqual(chosen["width"], 1366)
+        self.assertLessEqual(chosen["height"], 768)
+        self.assertLessEqual(requested["wh"][0], 1366)
+        self.assertLessEqual(requested["wh"][1], 768)
+
+    def test_set_mode_rejects_modes_larger_than_original(self):
+        mgr = DisplayManager.__new__(DisplayManager)
+        mgr._lock = __import__("threading").RLock()
+        mgr._original = {"width": 1366, "height": 768, "refresh": 60, "bpp": 32}
+        with mock.patch("core.display.IS_WIN", True):
+            ok, error = mgr.set_mode(1920, 1080, 60)
+        self.assertFalse(ok)
+        self.assertIn("превышает", error)
+
     def test_frame_ack_tracks_browser_backlog_and_latency(self):
         user = {"role": "owner", "profile": "dev", "max_fps": 60}
         server, session = self.make_server(user)
