@@ -347,7 +347,9 @@ function connectWs() {
     $('#netV').textContent = L.net_up_mbps + ' / ' + L.net_down_mbps + ' Мбит/с';
     $('#gpuTempV').textContent = (L.gpu_temp != null ? L.gpu_temp + '°C' : 'н/д') +
       (L.gpu_power_w != null ? ' / ' + L.gpu_power_w + ' Вт' : '');
-    $('#capV').textContent = d.capture_ok ? 'работает' : 'НЕДОСТУПЕН';
+    $('#capV').textContent = d.capture_ok
+      ? (d.video && d.video.available ? 'работает · H.264/NVENC готов' : 'работает · MJPEG')
+      : 'НЕДОСТУПЕН';
     $('#inpV').textContent = d.input_ok ? 'доступна' : 'недоступна';
     $('#reserveV').textContent = cfg.owner_reserve_percent + '%';
     $('#maxSessV').textContent = cfg.max_sessions;

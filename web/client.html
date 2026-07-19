@@ -357,6 +357,7 @@ async function openConnect(host) {
   try {
     const info = await (await fetch(`http://${ip}:${port}/api/info`)).json();
     const enc = info.encoders||{};
+    const video = info.video||null;
     const net = info.network||{};
     const node = info.node || {type:current.node_type || 'physical'};
     current.node_type = node.type;
@@ -367,7 +368,10 @@ async function openConnect(host) {
       <b>GPU</b><span>${esc((info.gpus||[]).map(g=>g.name).join(', ')||'—')}</span>
       <b>Аппаратные кодеки</b><span>${esc((enc.apis||[]).join(', ')||'нет')} ${enc.av1?'· AV1':''}</span>
       <b>LAN хоста</b><span class="${net.limited?'badge b-warn':''}">${esc(net.link_mbps ? net.link_mbps + ' Мбит/с' : '—')}</span>
-      <b>Кодек потока</b><span>MJPEG (MVP)</span>`;
+      <b>Кодек потока</b><span>${video && video.available
+        ? 'H.264 GPU готов'
+        : video ? 'MJPEG · '+esc(video.reason||'NVENC недоступен')
+          : 'MJPEG · обновите хост для H.264 GPU'}</span>`;
   } catch(e) { $('#dcInfo').innerHTML = '<b>Статус</b><span style="color:var(--err)">Хост недоступен по HTTP</span>'; }
   dlgConnect.showModal();
 }

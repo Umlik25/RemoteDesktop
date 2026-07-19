@@ -55,6 +55,35 @@ class StreamSettingsTests(unittest.TestCase):
         session.degrade = 1
         self.assertEqual((120, 60, 1.0), session.effective())
 
+    def test_auto_codec_selects_h264_when_host_and_browser_support_it(self):
+        user = {"role": "owner", "profile": "custom", "max_fps": 240}
+        server, session = self.make_server(user)
+        server.video_encoder = {"available": True, "executable": "ffmpeg"}
+
+        response = server._apply_stream_config(session, {
+            "fps": 60, "quality": 70, "scale": 1,
+            "video_codec": "auto", "video_codecs": {"h264_mse": True},
+        }, user)
+
+        self.assertEqual("h264", session.codec)
+        self.assertEqual({"selected": "auto", "applied": "h264"},
+                         response["codec"])
+        self.assertEqual(5, server.capture.max_fps)
+
+    def test_scaled_stream_keeps_mjpeg_fallback(self):
+        user = {"role": "owner", "profile": "custom", "max_fps": 240}
+        server, session = self.make_server(user)
+        server.video_encoder = {"available": True, "executable": "ffmpeg"}
+
+        response = server._apply_stream_config(session, {
+            "fps": 60, "quality": 70, "scale": 0.5,
+            "video_codec": "h264", "video_codecs": {"h264_mse": True},
+        }, user)
+
+        self.assertEqual("mjpeg", session.codec)
+        self.assertTrue(any("Уменьшенный масштаб" in reason
+                            for reason in response["reasons"]))
+
     def test_work_only_limit_is_visible_in_applied_state(self):
         user = {"role": "user", "profile": "design", "max_fps": 120,
                 "priority": "normal"}
@@ -252,6 +281,17 @@ class StreamSettingsTests(unittest.TestCase):
         self.assertEqual(2, session.client_queue)
         self.assertEqual(3.5, session.client_decode_ms)
         self.assertGreater(session.ack_latency_ms, 0)
+
+    def test_video_ack_reports_batched_decoded_frames(self):
+        _, session = self.make_server({"role": "owner", "max_fps": 120})
+
+        HostServer._apply_video_ack(session, {
+            "queue": 2, "decode_ms": 1.5, "frames": 4})
+
+        self.assertEqual(2, session.client_queue)
+        self.assertEqual(1.5, session.client_decode_ms)
+        self.assertEqual(4, session.frames)
+        self.assertEqual(4, len(session.frame_times))
         self.assertEqual([], list(session.sent_times))
 
     def test_client_display_size_distinguishes_screen_and_window(self):
@@ -348,6 +388,34 @@ class DisplayConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chosen, state["selected"])
         manager.set_best.assert_called_once_with(3456, 2234, 2_500_000)
         self.assertTrue(any("стабильных 120 FPS" in reason for reason in reasons))
+
+    async def test_h264_client_desktop_keeps_native_resolution(self):
+        server = HostServer.__new__(HostServer)
+        server.config = {}
+        server._frame_evt = None
+        server.video_encoder = {"available": True, "executable": "ffmpeg"}
+        user = {"role": "owner", "profile": "custom", "max_fps": 240}
+        session = Session(SimpleNamespace(), "owner", user, "127.0.0.1", "LAN Direct")
+        chosen = {"width": 3840, "height": 2160, "refresh": 60}
+        manager = SimpleNamespace(
+            available=True, current=lambda: chosen,
+            modes=lambda: [chosen],
+            set_best=mock.Mock(return_value=(True, chosen, None)),
+        )
+        server.display = manager
+        server.capture = SimpleNamespace(max_fps=30, restart=mock.Mock())
+        server.sessions = {session.sid: session}
+        server._display_owner = None
+
+        state, reasons = await server._apply_display_config(session, {
+            "desktop_mode": "client", "fps": 60, "scale": 1,
+            "video_codec": "auto", "video_codecs": {"h264_mse": True},
+            "client_display": {"screen": {"width": 3840, "height": 2160}},
+        }, user)
+
+        self.assertEqual(chosen, state["selected"])
+        manager.set_best.assert_called_once_with(3840, 2160, None)
+        self.assertFalse(any("MJPEG" in reason for reason in reasons))
 
 class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_distinct_precise_scales_do_not_share_encoded_cache(self):

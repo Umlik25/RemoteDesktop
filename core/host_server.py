@@ -29,7 +29,7 @@ from urllib.parse import quote, urlsplit
 import psutil
 from aiohttp import web, WSMsgType
 
-from . import auth, capability, display, hwinfo, state
+from . import auth, capability, display, hwinfo, state, video_encoder
 
 try:
     import mss
@@ -661,6 +661,12 @@ class Session:
         self.desktop_mode = "host"
         self.desktop_size = None
         self.desktop_target = None
+        self.codec_requested = "auto"
+        self.codec = "mjpeg"
+        self.codec_generation = 0
+        self.codec_reason = None
+        self.client_h264_mse = False
+        self.last_video_resync = 0.0
         self.send_id = 0
         self.last_ack_id = 0
         self.ack_latency_ms = 0.0
@@ -707,6 +713,8 @@ class Session:
                           "scale": self.scale, "adaptive": self.adaptive},
             "degrade": self.degrade, "net_degrade": self.net_degrade,
             "pipeline_degrade": self.pipeline_degrade,
+            "codec": self.codec,
+            "codec_requested": self.codec_requested,
             "bitrate_mbps": round(self.bitrate_mbps, 1),
             "frames": self.frames,
             "ack_latency_ms": round(self.ack_latency_ms, 1),
@@ -736,6 +744,7 @@ class HostServer:
         self._enc_jobs = {}        # (seq, q, scale) -> future с кодированным кадром
         self._load_cache = (0.0, None)
         self._load_task = None
+        self.video_encoder = video_encoder.unavailable()
         self._loop = None
         self._frame_evt = None     # событие «есть новый кадр» для отправителей
         self._login_attempts = collections.defaultdict(collections.deque)
@@ -809,6 +818,7 @@ class HostServer:
         self._frame_evt = asyncio.Event()
         self.static_info = await loop.run_in_executor(_executor, hwinfo.get_static_info)
         self.bench = await loop.run_in_executor(_executor, hwinfo.quick_benchmark)
+        self.video_encoder = await loop.run_in_executor(_executor, video_encoder.detect)
         if CAPTURE_OK:
             self.capture.on_frame = self._frame_notify_threadsafe
             self.capture.start()
@@ -1182,8 +1192,12 @@ class HostServer:
         width = int(max(800, min(8192, raw_width)))
         height = int(max(600, min(8192, raw_height)))
         requested_fps = int(round(self._stream_number(data.get("fps"), sess.fps)))
+        # NVENC получает D3D11-кадр напрямую и нормально работает с 4K.
+        # Ограничение до ~2.5 Мп нужно только запасному CPU-MJPEG пути.
+        hardware_video = self._h264_eligible(sess, data)
         pixel_budget = (SMOOTH_DESKTOP_MAX_PIXELS
-                        if requested_fps >= SMOOTH_DESKTOP_MIN_FPS else None)
+                        if requested_fps >= SMOOTH_DESKTOP_MIN_FPS
+                        and not hardware_video else None)
         try:
             candidate = display.best_mode(
                 manager.modes(), width, height, max_pixels=pixel_budget)
@@ -1254,6 +1268,32 @@ class HostServer:
                 pass
         self._display_owner = None
 
+    async def _fit_display_for_mjpeg(self, sess):
+        """После сбоя NVENC не оставлять запасной JPEG-конвейер в 4K."""
+        selected = sess.desktop_size or {}
+        target = sess.desktop_target or {}
+        if (getattr(self, "_display_owner", None) != sess.sid
+                or selected.get("width", 0) * selected.get("height", 0)
+                <= SMOOTH_DESKTOP_MAX_PIXELS):
+            return None
+        width, height = target.get("width"), target.get("height")
+        if not width or not height:
+            return None
+        try:
+            ok, chosen, _ = await asyncio.get_running_loop().run_in_executor(
+                _executor, self.display.set_best, width, height,
+                SMOOTH_DESKTOP_MAX_PIXELS)
+        except Exception:
+            return None
+        if not ok or not chosen:
+            return None
+        sess.desktop_size = chosen
+        sess.desktop_target = {**target, "max_pixels": SMOOTH_DESKTOP_MAX_PIXELS}
+        self._display_refresh_hz = int(chosen.get("refresh") or 0)
+        self.capture.restart()
+        self._reset_stream_adaptation()
+        return chosen
+
     @staticmethod
     def _stream_number(value, fallback):
         try:
@@ -1285,6 +1325,20 @@ class HostServer:
         sess.client_queue = queue
         sess.client_decode_ms = decode_ms
 
+    @staticmethod
+    def _apply_video_ack(sess, data):
+        try:
+            queue = max(0, min(120, int(data.get("queue", 0))))
+            decode_ms = max(0.0, min(10_000.0, float(data.get("decode_ms", 0))))
+            frame_count = max(1, min(12, int(data.get("frames", 1))))
+        except (TypeError, ValueError, OverflowError):
+            return
+        now = time.monotonic()
+        sess.client_queue = queue
+        sess.client_decode_ms = decode_ms
+        sess.frame_times.extend([now] * frame_count)
+        sess.frames += frame_count
+
     def _stream_state(self, sess, user=None, reasons=None):
         """Выбранные и фактически применённые параметры для ответа клиенту."""
         user = user or sess.user
@@ -1306,6 +1360,8 @@ class HostServer:
             why.append(
                 f"Дисплей хоста работает на {refresh} Гц, поэтому поток "
                 f"ограничен до {refresh} FPS")
+        if sess.codec_reason:
+            why.append(sess.codec_reason)
         # Не дублируем одинаковые причины между валидацией и текущим состоянием.
         why = list(dict.fromkeys(why))
         return {
@@ -1315,9 +1371,40 @@ class HostServer:
                 "adaptive": sess.adaptive,
             },
             "applied": {"fps": fps, "quality": quality, "scale": scale},
+            "codec": {"selected": sess.codec_requested,
+                      "applied": sess.codec},
             "limits": self._stream_limits(user),
             "reasons": why,
         }
+
+    def _public_video_capabilities(self):
+        capabilities = dict(getattr(self, "video_encoder", {}) or {})
+        capabilities.pop("executable", None)
+        return capabilities
+
+    def _h264_eligible(self, sess, data):
+        requested = data.get("video_codec", sess.codec_requested)
+        client = data.get("video_codecs")
+        client_h264 = (bool(client.get("h264_mse"))
+                       if isinstance(client, dict) else sess.client_h264_mse)
+        scale = self._stream_number(data.get("scale"), sess.scale)
+        capabilities = getattr(self, "video_encoder", {}) or {}
+        return bool(requested != "mjpeg" and client_h264
+                    and capabilities.get("available") and scale >= 0.999)
+
+    def _select_stream_codec(self, sess):
+        if sess.codec_requested == "mjpeg":
+            return "mjpeg", None
+        capabilities = getattr(self, "video_encoder", {}) or {}
+        if not sess.client_h264_mse:
+            reason = "Браузер не поддерживает H.264 Media Source Extensions"
+        elif not capabilities.get("available"):
+            reason = capabilities.get("reason") or "Аппаратный H.264 недоступен"
+        elif sess.scale < 0.999:
+            reason = "Уменьшенный масштаб использует MJPEG; H.264 GPU передаёт родное разрешение"
+        else:
+            return "h264", None
+        return "mjpeg", reason if sess.codec_requested == "h264" else None
 
     def _apply_stream_config(self, sess, data, user):
         """Безопасно применяет настройки потока и возвращает подтверждение.
@@ -1345,15 +1432,24 @@ class HostServer:
             reasons.append("Масштаб ограничен диапазоном 25–100%")
 
         old_effective = self._stream_params(sess)
-        old_selected = (sess.fps, sess.quality, sess.scale, sess.adaptive, sess.profile)
+        old_selected = (sess.fps, sess.quality, sess.scale, sess.adaptive,
+                        sess.profile, sess.codec_requested, sess.codec)
         profile = data.get("profile")
         if profile in capability.STREAM_PROFILES:
             sess.profile = profile
         adaptive = data.get("adaptive", sess.adaptive)
         if isinstance(adaptive, bool):
             sess.adaptive = adaptive
+        codec_requested = data.get("video_codec", sess.codec_requested)
+        if codec_requested in ("auto", "h264", "mjpeg"):
+            sess.codec_requested = codec_requested
+        client_codecs = data.get("video_codecs")
+        if isinstance(client_codecs, dict):
+            sess.client_h264_mse = bool(client_codecs.get("h264_mse"))
 
         sess.fps, sess.quality, sess.scale = fps, quality, scale
+        sess.codec, codec_reason = self._select_stream_codec(sess)
+        sess.codec_reason = codec_reason
         sess.user = user
         sess.net_degrade = 0
         sess.pipeline_degrade = 0
@@ -1364,7 +1460,10 @@ class HostServer:
         image_params_changed = (int(old_effective[1]) != int(new_effective[1])
                                 or abs(old_effective[2] - new_effective[2]) > 1e-6)
         changed = old_selected != (sess.fps, sess.quality, sess.scale,
-                                   sess.adaptive, sess.profile)
+                                   sess.adaptive, sess.profile,
+                                   sess.codec_requested, sess.codec)
+        if changed:
+            sess.codec_generation += 1
         if image_params_changed:
             sess.force_full = True
         self._refresh_capture_fps()
@@ -1394,12 +1493,15 @@ class HostServer:
             session.encode_ms_ewma = 0.0
             session.send_ms_ewma = 0.0
             session.force_full = True
+            if session.codec == "h264":
+                session.codec_generation += 1
         self._refresh_capture_fps()
         self._notify_frame()
 
     def _refresh_capture_fps(self):
-        targets = [self._stream_params(s)[0] for s in self.sessions.values()]
-        self.capture.max_fps = max(targets, default=30)
+        targets = [self._stream_params(s)[0] for s in self.sessions.values()
+                   if s.codec != "h264"]
+        self.capture.max_fps = max(targets, default=(5 if self.sessions else 30))
 
     async def _encoded(self, frame, quality, scale, region=None):
         """Кодирование с общим кэшем: один и тот же кадр/область с одинаковыми
@@ -1482,6 +1584,7 @@ class HostServer:
             "ram_gb": s.get("ram_gb"),
             "gpus": s.get("gpus"),
             "encoders": s.get("encoders"),
+            "video": self._public_video_capabilities(),
             "network": self._network_state(),
             "accepting": self.config.get("accepting", True),
             "input_ok": INPUT_OK,
@@ -1548,7 +1651,8 @@ class HostServer:
         cap = capability.capacity_plan(self.static_info, self.bench, load, self.config)
         return web.json_response({"static": self.static_info, "bench": self.bench,
                                   "load": load, "report": rep, "capacity": cap,
-                                  "config": self.config})
+                                  "config": self.config,
+                                  "video": self._public_video_capabilities()})
 
     async def api_load(self, request):
         if not self._admin(request):
@@ -1874,6 +1978,7 @@ class HostServer:
                                  for s in self.sessions.values()],
                     "config": self.config,
                     "capture_ok": CAPTURE_OK, "input_ok": INPUT_OK,
+                    "video": self._public_video_capabilities(),
                 })
                 try:
                     await asyncio.wait_for(ws.receive(), timeout=2.0)
@@ -1915,7 +2020,8 @@ class HostServer:
                             "host_name": self.host_name(),
                             "node": self.node_identity(),
                             "route": sess.route,
-                            "codec": "MJPEG (MVP; H.264/HEVC в дорожной карте)",
+                            "codec": "H.264/NVENC с автоматическим MJPEG fallback",
+                            "video": self._public_video_capabilities(),
                             "screen": scr,
                             "profile": sess.profile,
                             "fps": sess.fps, "quality": sess.quality, "scale": sess.scale,
@@ -1932,7 +2038,7 @@ class HostServer:
                                 "Все удалённые сессии этого узла видят общий рабочий стол физического хоста."
                             )})
         self._refresh_capture_fps()
-        sender = asyncio.create_task(self._frame_sender(sess))
+        sender = asyncio.create_task(self._media_sender(sess))
         stats = asyncio.create_task(self._stats_sender(sess))
         cursor = asyncio.create_task(self._cursor_sender(sess))
         try:
@@ -1964,6 +2070,13 @@ class HostServer:
                     await ws.send_json(applied)
                 elif t == "frame_ack":
                     self._apply_frame_ack(sess, d)
+                elif t == "video_ack":
+                    self._apply_video_ack(sess, d)
+                elif t == "video_resync" and sess.codec == "h264":
+                    now = time.monotonic()
+                    if now - sess.last_video_resync >= 0.5:
+                        sess.last_video_resync = now
+                        sess.codec_generation += 1
                 elif t == "refresh":
                     # клиент просит полный кадр (потерял дельта-цепочку)
                     sess.force_full = True
@@ -1995,6 +2108,119 @@ class HostServer:
                 "reason": sess.kick_reason or "client"})
         return ws
 
+    async def _media_sender(self, sess):
+        """Переключает медиаконвейер без разрыва сессии."""
+        announced = None
+        while not sess.ws.closed:
+            if sess.codec == "h264":
+                reason = await self._h264_sender(sess)
+                if reason and not sess.ws.closed:
+                    sess.codec = "mjpeg"
+                    sess.codec_reason = f"NVENC отключён: {reason}. Используется MJPEG"
+                    sess.codec_generation += 1
+                    sess.force_full = True
+                    chosen = await self._fit_display_for_mjpeg(sess)
+                    if chosen:
+                        sess.codec_reason += (
+                            f"; Windows переключена на {chosen['width']}×{chosen['height']} "
+                            "для сохранения плавности")
+                    self._refresh_capture_fps()
+                announced = "h264"
+                continue
+            if announced != "mjpeg":
+                try:
+                    await sess.ws.send_json({
+                        "type": "video_stream", "codec": "mjpeg",
+                        "reason": sess.codec_reason})
+                except (ConnectionError, RuntimeError):
+                    break
+                announced = "mjpeg"
+            await self._frame_sender(sess)
+
+    async def _h264_sender(self, sess):
+        """Desktop Duplication -> NVENC -> fragmented MP4 -> WebSocket."""
+        generation = sess.codec_generation
+        fps, quality, _ = self._stream_params(sess)
+        current = None
+        try:
+            current = self.display.current() if self.display.available else None
+        except Exception:
+            current = None
+        frame = self.capture.frame
+        width = int((current or {}).get("width") or (frame[1] if frame else 1920))
+        height = int((current or {}).get("height") or (frame[2] if frame else 1080))
+        network = self._network_state(sess)
+        try:
+            command = video_encoder.command(
+                self.video_encoder, fps, quality, width, height,
+                network.get("safe_stream_mbps", 0))
+        except ValueError as exc:
+            return str(exc)
+        sess.required_mbps = video_encoder.target_bitrate_mbps(
+            width, height, fps, quality, network.get("safe_stream_mbps", 0))
+        creationflags = 0x08000000 if os.name == "nt" else 0
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, creationflags=creationflags)
+        except (OSError, NotImplementedError) as exc:
+            return f"не удалось запустить FFmpeg ({exc})"
+        stderr_tail = collections.deque(maxlen=12)
+
+        async def read_errors():
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                stderr_tail.append(line.decode("utf-8", "replace").strip())
+
+        error_task = asyncio.create_task(read_errors())
+        try:
+            await sess.ws.send_json({
+                "type": "video_stream", "codec": "h264",
+                "mime": video_encoder.H264_MIME,
+                "width": width, "height": height, "fps": fps,
+                "encoder": "NVENC"})
+            sent_any = False
+            while (not sess.ws.closed and sess.codec == "h264"
+                   and sess.codec_generation == generation):
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(64 * 1024), timeout=5.0)
+                except asyncio.TimeoutError:
+                    return "FFmpeg не выдал видеоданные"
+                if not chunk:
+                    detail = next((line for line in reversed(stderr_tail) if line), "")
+                    return detail[-280:] or f"FFmpeg завершился с кодом {proc.returncode}"
+                sent_any = True
+                started = time.perf_counter()
+                await sess.ws.send_bytes(chunk)
+                send_ms = (time.perf_counter() - started) * 1000
+                sess.send_ms_ewma = (send_ms if not sess.send_ms_ewma
+                                     else sess.send_ms_ewma * 0.75 + send_ms * 0.25)
+                self._record_stream_bytes(sess, len(chunk))
+            return None if sent_any else "NVENC не успел запустить поток"
+        except (ConnectionError, RuntimeError):
+            return None
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=1.5)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    if proc.returncode is None:
+                        proc.kill()
+            error_task.cancel()
+            await asyncio.gather(error_task, return_exceptions=True)
+
+    def _record_stream_bytes(self, sess, count):
+        sess.bytes += count
+        sess.total_bytes += count
+        now = time.time()
+        if now - sess.last_bytes_ts >= 1.0:
+            sess.bitrate_mbps = sess.bytes * 8 / 1e6 / (now - sess.last_bytes_ts)
+            sess.bytes = 0
+            sess.last_bytes_ts = now
+
     async def _frame_sender(self, sess):
         """Отправка кадров: ДЕЛЬТА-КАДРЫ (только изменённые области экрана) —
         это радикально снижает битрейт и задержку по Wi-Fi. Полный кадр идёт
@@ -2015,7 +2241,7 @@ class HostServer:
         pipeline_pressure_since = None
         pipeline_good_since = None
         last_pipeline_adapt = time.monotonic()
-        while not sess.ws.closed:
+        while not sess.ws.closed and sess.codec == "mjpeg":
             ev = self._frame_evt
             fps, quality, scale = self._stream_params(sess)
             budget = 1.0 / max(fps, 1)
@@ -2190,13 +2416,7 @@ class HostServer:
             elif sess.net_degrade:
                 sess.net_degrade = 0
             sess.frames += 1
-            sess.bytes += len(msg)
-            sess.total_bytes += len(msg)
-            nowt = time.time()
-            if nowt - sess.last_bytes_ts >= 1.0:
-                sess.bitrate_mbps = sess.bytes * 8 / 1e6 / (nowt - sess.last_bytes_ts)
-                sess.bytes = 0
-                sess.last_bytes_ts = nowt
+            self._record_stream_bytes(sess, len(msg))
 
     async def _stats_sender(self, sess):
         while not sess.ws.closed:
@@ -2216,13 +2436,14 @@ class HostServer:
                 warn.append(f"Канал не успевает за потоком (ступень {sess.net_degrade}): "
                             f"качество временно снижено. Помогут меньший FPS/масштаб "
                             f"или кабельное подключение.")
-            if sess.pipeline_degrade > 0:
+            if sess.pipeline_degrade > 0 and sess.codec == "mjpeg":
                 warn.append(
                     f"Хост не успевает захватывать или кодировать выбранный поток "
                     f"(ступень {sess.pipeline_degrade}). Автоадаптация снизила "
                     f"параметры до устойчивого режима.")
             network = self._network_state(sess)
             capture_perf = self.capture.performance()
+            media_fps = round(_recent_rate(sess.frame_times), 1)
             if network["limited"]:
                 warn.append(
                     f"Ethernet хоста согласован только на {network['link_mbps']} Мбит/с. "
@@ -2234,9 +2455,14 @@ class HostServer:
                 await sess.ws.send_json({
                     "type": "stats", "host": load,
                     "session": sess.info((fps, quality, scale)),
-                    "codec": "MJPEG", "capture": self.capture.backend,
-                    "capture_fps": capture_perf["fps"],
-                    "capture_process_ms": capture_perf["process_ms"],
+                    "codec": ("H.264 NVENC" if sess.codec == "h264" else "MJPEG"),
+                    "video": self._public_video_capabilities(),
+                    "capture": ("ddagrab" if sess.codec == "h264"
+                                else self.capture.backend),
+                    "capture_fps": (media_fps if sess.codec == "h264"
+                                    else capture_perf["fps"]),
+                    "capture_process_ms": (0 if sess.codec == "h264"
+                                           else capture_perf["process_ms"]),
                     "route": sess.route,
                     "fps_target": fps, "quality": quality, "scale": scale,
                     "network": network,

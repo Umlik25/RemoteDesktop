@@ -8,8 +8,12 @@
 * { box-sizing:border-box; }
 body { margin:0; background:#000; color:var(--fg); font:13px "Segoe UI",system-ui,sans-serif; overflow:hidden; }
 #stage { position:fixed; inset:0; background:#000; }
+#remoteVideo, canvas#cv {
+  position:absolute; inset:0; width:100%; height:100%; display:block;
+  object-fit:contain;
+}
+#remoteVideo { background:#000; display:none; }
 canvas#cv {
-  width:100%; height:100%; display:block; object-fit:contain;
   outline:none; background:#000; cursor:none;
 }
 #toolbar {
@@ -74,7 +78,10 @@ dialog::backdrop { background:rgba(0,0,0,.7); }
 </head>
 <body>
 <div id="msg"><h2 id="msgText">Подключение…</h2><div id="msgSub" style="color:#8b93a7;max-width:480px"></div></div>
-<div id="stage" style="display:none"><canvas id="cv" tabindex="0"></canvas></div>
+<div id="stage" style="display:none">
+  <video id="remoteVideo" autoplay muted playsinline></video>
+  <canvas id="cv" tabindex="0"></canvas>
+</div>
 
 <div id="toolbar" style="display:none">
   <button id="btnOverlay" class="acc" onclick="toggleOverlay()">📊 Оверлей</button>
@@ -83,6 +90,11 @@ dialog::backdrop { background:rgba(0,0,0,.7); }
     <option value="design">Дизайн</option><option value="video">Видео</option>
     <option value="game">Игры</option><option value="competitive">Соревн.</option>
     <option value="custom">Свой</option>
+  </select>
+  <select id="selCodec" onchange="sendConfig()" title="Авто использует H.264/NVENC, когда его поддерживают хост и браузер">
+    <option value="auto">Кодек: авто</option>
+    <option value="h264">H.264 GPU</option>
+    <option value="mjpeg">MJPEG</option>
   </select>
   <select id="selFps" onchange="manualConfigChanged()" title="Частота передачи кадров"><option>15</option><option>30</option><option>60</option><option>90</option><option>120</option><option>144</option></select>
   <select id="selQ" onchange="manualConfigChanged()" title="Качество JPEG">
@@ -155,7 +167,7 @@ const $ = s => document.querySelector(s);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 })[ch]);
-const cv = $('#cv'), ctx = cv.getContext('2d');
+const cv = $('#cv'), ctx = cv.getContext('2d'), remoteVideo = $('#remoteVideo');
 const base = document.createElement('canvas');       // содержимое экрана хоста
 const bctx = base.getContext('2d');
 const toolbar = $('#toolbar');
@@ -165,6 +177,10 @@ const IS_MAC = /Mac|iPhone|iPad/i.test(navigator.platform || '')
   || /Mac/i.test((navigator.userAgentData && navigator.userAgentData.platform) || '');
 
 let ws, hello = null, lastStats = null, streamState = null, displayState = null;
+const H264_MIME = 'video/mp4; codecs="avc1.640033"';
+const H264_MSE = !!(window.MediaSource && MediaSource.isTypeSupported(H264_MIME));
+let mediaMode = 'mjpeg', mediaSource = null, sourceBuffer = null;
+let mediaQueue = [], mediaQueueBytes = 0, mediaUrl = null, mediaResetPending = false;
 let confirmationResolver = null;
 
 function askConfirmation(title, text, action='Продолжить') {
@@ -214,6 +230,7 @@ function ensureSelectValue(select, value, label) {
 ensureSelectValue($('#selFps'), P.get('fps') || '60');
 ensureSelectValue($('#selQ'), P.get('quality') || '70', `Q${P.get('quality')}`);
 $('#selProfile').value = P.get('profile') || 'dev';
+$('#selCodec').value = ['h264','mjpeg'].includes(P.get('codec')) ? P.get('codec') : 'auto';
 $('#selAdaptive').value = P.get('adaptive') === '0' ? 'fixed' : 'auto';
 $('#selDesktop').value = ['client','viewport'].includes(P.get('desktop')) ? P.get('desktop') : 'host';
 updateDesktopOptions();
@@ -303,8 +320,9 @@ function renderLoop() {
   const st = cursorState();
   const blocked = !permissions.input || !inputEnabled;
   const key = [st.show, Math.round(st.px), Math.round(st.py), hostCursorType, blocked, captured].join('|');
-  if ((dirty || key !== lastDrawKey) && cv.width && base.width) {
-    ctx.drawImage(base, 0, 0);
+  if ((dirty || key !== lastDrawKey) && cv.width && (mediaMode === 'h264' || base.width)) {
+    if (mediaMode === 'h264') ctx.clearRect(0, 0, cv.width, cv.height);
+    else ctx.drawImage(base, 0, 0);
     if (st.show) {
       const c = CURSOR_SVGS[hostCursorType] || CURSOR_SVGS['default'];
       const img = cursorImgs[hostCursorType] || cursorImgs['default'];
@@ -330,7 +348,108 @@ function renderLoop() {
 }
 requestAnimationFrame(renderLoop);
 
-// ================== ПОТОК: дельта-кадры ==================
+// ================== H.264/NVENC: fragmented MP4 + MSE ==================
+function stopMediaSource() {
+  mediaQueue = []; mediaQueueBytes = 0; sourceBuffer = null;
+  if (mediaSource && mediaSource.readyState === 'open') {
+    try { mediaSource.endOfStream(); } catch(_) {}
+  }
+  mediaSource = null;
+  remoteVideo.pause();
+  remoteVideo.removeAttribute('src'); remoteVideo.load();
+  if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+  mediaUrl = null;
+}
+function useMjpeg(reason) {
+  if (mediaMode === 'h264') stopMediaSource();
+  mediaMode = 'mjpeg'; remoteVideo.style.display = 'none';
+  cv.style.background = '#000'; mediaResetPending = false;
+  if (reason) hint(reason, 6000);
+  dirty = true;
+}
+function useH264(info) {
+  stopMediaSource();
+  mediaMode = 'h264'; mediaResetPending = false;
+  base.width = base.height = 0;
+  cv.width = Math.max(2, Number(info.width) || cv.width || 1920);
+  cv.height = Math.max(2, Number(info.height) || cv.height || 1080);
+  cv.style.background = 'transparent'; remoteVideo.style.display = 'block';
+  mediaSource = new MediaSource();
+  mediaUrl = URL.createObjectURL(mediaSource); remoteVideo.src = mediaUrl;
+  mediaSource.addEventListener('sourceopen', () => {
+    if (mediaMode !== 'h264' || !mediaSource || mediaSource.readyState !== 'open') return;
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer(info.mime || H264_MIME);
+      sourceBuffer.mode = 'segments';
+      sourceBuffer.addEventListener('updateend', onMediaUpdate);
+      pumpMedia();
+      remoteVideo.play().catch(()=>{});
+    } catch (error) {
+      requestVideoResync('Браузер не смог открыть H.264: ' + error.message);
+    }
+  }, {once:true});
+}
+function requestVideoResync(reason) {
+  if (mediaResetPending || !ws || ws.readyState !== 1) return;
+  mediaResetPending = true; mediaQueue = []; mediaQueueBytes = 0;
+  ws.send(JSON.stringify({type:'video_resync'}));
+  if (reason) hint(reason, 5000);
+}
+function enqueueMedia(buffer) {
+  mediaQueue.push(buffer); mediaQueueBytes += buffer.byteLength;
+  // Задержку не лечим накоплением видео. Новый NVENC-процесс пришлёт init
+  // segment и keyframe, поэтому восстановление не зависит от старого буфера.
+  if (mediaQueueBytes > 16 * 1024 * 1024) {
+    requestVideoResync('Видеодекодер отстал, поток синхронизируется заново');
+    return;
+  }
+  pumpMedia();
+}
+function pumpMedia() {
+  if (!sourceBuffer || sourceBuffer.updating || !mediaQueue.length || mediaResetPending) return;
+  const chunk = mediaQueue.shift(); mediaQueueBytes -= chunk.byteLength;
+  try { sourceBuffer.appendBuffer(chunk); }
+  catch (error) { requestVideoResync('Ошибка видеобуфера: ' + error.message); }
+}
+function onMediaUpdate() {
+  if (!sourceBuffer || mediaMode !== 'h264') return;
+  try {
+    if (sourceBuffer.buffered.length) {
+      const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+      const lag = end - remoteVideo.currentTime;
+      if (lag > 0.18) remoteVideo.currentTime = Math.max(0, end - 0.045);
+      if (remoteVideo.paused) remoteVideo.play().catch(()=>{});
+      const start = sourceBuffer.buffered.start(0);
+      if (!mediaQueue.length && end - start > 4 && remoteVideo.currentTime > 1) {
+        sourceBuffer.remove(start, remoteVideo.currentTime - 0.5);
+        return;
+      }
+    }
+  } catch(_) {}
+  pumpMedia();
+}
+let videoAckCounter = 0;
+function onHardwareVideoFrame(now, metadata) {
+  if (mediaMode === 'h264') {
+    const w = remoteVideo.videoWidth, h = remoteVideo.videoHeight;
+    if (w && h && (cv.width !== w || cv.height !== h)) {
+      cv.width = w; cv.height = h; desktopWH = [w, h]; dirty = true;
+    }
+    if (lastFrameT) frameGapMs = now - lastFrameT;
+    lastFrameT = now; frames++;
+    decodeMs = Number(metadata.processingDuration || 0) * 1000;
+    if (++videoAckCounter % 4 === 0 && ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({type:'video_ack', queue:mediaQueue.length,
+        decode_ms:decodeMs, frames:4}));
+    }
+  }
+  remoteVideo.requestVideoFrameCallback(onHardwareVideoFrame);
+}
+if (remoteVideo.requestVideoFrameCallback) {
+  remoteVideo.requestVideoFrameCallback(onHardwareVideoFrame);
+}
+
+// ================== MJPEG: дельта-кадры ==================
 // v2: [0xA7, 2, kind, 0, x:u16, y:u16, fw:u16, fh:u16,
 // id:u32, capture_ts:f64] + JPEG. v1 и legacy full-JPEG тоже поддерживаются.
 function connect() {
@@ -369,6 +488,7 @@ function requestRefresh() {
 function onMsg(e) {
   if (typeof e.data === 'string') { onText(JSON.parse(e.data)); return; }
   bytesAcc += e.data.byteLength;
+  if (mediaMode === 'h264') { enqueueMedia(e.data); return; }
   const dv = new DataView(e.data);
   let item;
   if (e.data.byteLength > 24 && dv.getUint8(0) === 0xA7 && dv.getUint8(1) === 2) {
@@ -438,6 +558,7 @@ async function onText(d) {
     desktopWH = d.screen || desktopWH;
     applyHostLimits(d.limits || (d.stream && d.stream.limits));
     applyPermissions(d.permissions || {});
+    applyVideoCapabilities(d.video || {});
     applyDisplayState(d.display, false);
     document.title = `App_Remote — ${d.host_name}`;
     $('#msg').style.display = 'none';
@@ -453,6 +574,9 @@ async function onText(d) {
     if (captureMode && permissions.input) {
       hint('Кликните по экрану — мышь захватится (полный экран). Выход: удерживайте Esc.', 6000);
     }
+  } else if (d.type === 'video_stream') {
+    if (d.codec === 'h264') useH264(d);
+    else useMjpeg(d.reason);
   } else if (d.type === 'config_applied') {
     const requestId = Number(d.request_id) || 0;
     if (!requestId || requestId >= lastConfigAck) {
@@ -528,12 +652,14 @@ function renderOverlay() {
     <b>${esc(hello ? hello.host_name : '')}</b>
     <div class="sec">ПОТОК</div>
     FPS: браузер <b>${fpsShown}</b> · хост <b>${sess.actual_fps ?? '—'}</b> · захват <b>${s.capture_fps ?? '—'}</b> (применено ${applied.fps ?? s.fps_target ?? $('#selFps').value}, выбрано ${selected.fps ?? $('#selFps').value})<br>
-    Frame time: <b>${frameGapMs.toFixed(1)} мс</b> · захват: <b>${s.capture_process_ms ?? '—'} мс</b> · JPEG: <b>${sess.encode_ms ?? '—'} мс</b> · отправка: <b>${sess.send_ms ?? '—'} мс</b><br>
-    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · LAN хоста: <b>${network.link_mbps ? network.link_mbps + ' Мбит/с' : '—'}</b> · Кодек: <b>MJPEG-дельта</b><br>
-    Нужно для движения: <b>${sess.required_mbps ?? '—'} Мбит/с</b> · безопасный предел: <b>${network.safe_stream_mbps ?? '—'} Мбит/с</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
+    Frame time: <b>${frameGapMs.toFixed(1)} мс</b> · захват: <b>${s.capture_process_ms ?? '—'} мс</b> · ${mediaMode === 'h264' ? 'NVENC: <b>GPU</b>' : `JPEG: <b>${sess.encode_ms ?? '—'} мс</b>`} · отправка: <b>${sess.send_ms ?? '—'} мс</b><br>
+    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · LAN хоста: <b>${network.link_mbps ? network.link_mbps + ' Мбит/с' : '—'}</b> · Кодек: <b>${esc(s.codec || (mediaMode === 'h264' ? 'H.264 NVENC' : 'MJPEG-дельта'))}</b><br>
+    Нужно для движения: <b>${sess.required_mbps ?? '—'} Мбит/с</b> · безопасный предел: <b>${network.safe_stream_mbps ?? '—'} Мбит/с</b> · Захват: <b>${s.capture === 'ddagrab' ? 'Desktop Duplication GPU' : s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
     Поток: <b>${cv.width}×${cv.height}</b> · Экран: <b>${sizeText(clientDisplay.screen)}</b> · Окно: <b>${sizeText(clientDisplay.viewport)}</b><br>
     Рабочий стол Windows: <b>${desktop.width ? desktop.width + '×' + desktop.height : '—'}</b> · Очередь: <b>${sess.client_queue ?? frameQueue.length}</b><br>
-    Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>
+    ${mediaMode === 'h264'
+      ? `GPU-видео: <b>аппаратное кодирование и декодирование</b><br>`
+      : `Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>`}
     Профиль: <b>${esc(sess.profile || $('#selProfile').value)}</b> · Q${esc(applied.quality ?? s.quality ?? '—')} (выбрано Q${esc(selected.quality ?? $('#selQ').value)}) · Адаптация: <b>${selected.adaptive === false ? 'фикс.' : 'авто'}</b><br>
     Режим: <b>${modeTxt}</b> · Ввод: <b>${keyMode === 'text' ? 'работа · ускорение' : 'игра · raw'}</b>
     <div class="sec">ЗАДЕРЖКИ</div>
@@ -592,6 +718,15 @@ function applyHostLimits(limits) {
   }
   $('#selFps').title = `Частота передачи кадров. Лимит учётной записи: ${maxFps} FPS`;
 }
+function applyVideoCapabilities(capabilities) {
+  const option = $('#selCodec').querySelector('option[value="h264"]');
+  const available = H264_MSE && capabilities.available;
+  option.disabled = !available;
+  option.title = !H264_MSE
+    ? 'Этот браузер не поддерживает H.264 Media Source Extensions'
+    : (!capabilities.available ? (capabilities.reason || 'NVENC недоступен') : 'RTX/NVENC доступен');
+  if (!available && $('#selCodec').value === 'h264') $('#selCodec').value = 'auto';
+}
 function setStreamStatus(state, pending=false) {
   const badge = $('#streamStatus');
   if (pending) {
@@ -602,7 +737,8 @@ function setStreamStatus(state, pending=false) {
   const applied = state.applied;
   const [w, h] = streamDimensions(applied.scale);
   const reasons = state.reasons || [];
-  badge.textContent = `${w}×${h} · ${applied.fps} FPS · Q${applied.quality}`;
+  const codec = state.codec && state.codec.applied === 'h264' ? 'H.264 GPU' : 'MJPEG';
+  badge.textContent = `${w}×${h} · ${applied.fps} FPS · ${codec}`;
   badge.className = `badge ${reasons.length ? 'b-warn' : 'b-ok'}`;
   badge.title = reasons.length ? reasons.join('\n') : 'Хост подтвердил эти параметры';
 }
@@ -615,6 +751,9 @@ function applyStreamState(state, announce) {
   if (selected.quality != null) ensureSelectValue($('#selQ'), selected.quality, `Q${selected.quality}`);
   if (selected.scale != null) selectScale(selected.scale);
   if (selected.profile) $('#selProfile').value = selected.profile;
+  if (state.codec && ['auto','h264','mjpeg'].includes(state.codec.selected)) {
+    $('#selCodec').value = state.codec.selected;
+  }
   if (typeof selected.adaptive === 'boolean') {
     $('#selAdaptive').value = selected.adaptive ? 'auto' : 'fixed';
   }
@@ -673,10 +812,11 @@ function buildResSelect(send=true) {
   const want = resolutionBuilt && Number.isFinite(previousScale)
     ? previousScale : (P.get('scale') || 'auto');
   if (want === 'auto') {
-    // дельта-кадры сильно снижают трафик, но полные кадры 1440p/4K всё ещё
-    // тяжёлые — для плавности стартуем с 1080p
+    // NVENC держит родное разрешение без CPU-копирования; MJPEG стартует с
+    // 1080p, чтобы не перегружать захват и JPEG.
     let option = findScaleOption(1);
-    if (nh > 1200) {
+    const hardwareVideo = H264_MSE && hello && hello.video && hello.video.available;
+    if (!hardwareVideo && nh > 1200) {
       const match = [...sel.options].find(item => /×1080(?:\D|$)/.test(item.textContent));
       if (match) { option = match; hint('Разрешение потока: 1080p для плавности. Родное — в панели сверху.', 6000); }
     }
@@ -851,6 +991,8 @@ function sendConfig() {
   setStreamStatus(null, true);
   ws.send(JSON.stringify({type:'config', request_id:requestId, fps, quality, scale,
     profile:$('#selProfile').value, adaptive:$('#selAdaptive').value === 'auto',
+    video_codec:$('#selCodec').value,
+    video_codecs:{h264_mse:H264_MSE},
     desktop_mode:$('#selDesktop').value,
     client_width:clientDisplay.screen.width, client_height:clientDisplay.screen.height,
     client_display:clientDisplay}));

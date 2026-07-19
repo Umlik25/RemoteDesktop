@@ -10,3 +10,5 @@ numpy; sys_platform == "win32"
 # Быстрое JPEG-кодирование на хосте (libjpeg-turbo, в 3-5 раз быстрее Pillow).
 # Необязательно: без него используется Pillow.
 opencv-python-headless; sys_platform == "win32"
+# Готовый FFmpeg-бинарник; на RTX используется Desktop Duplication -> NVENC.
+imageio-ffmpeg>=0.6; sys_platform == "win32"
