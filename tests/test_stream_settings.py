@@ -68,6 +68,34 @@ class StreamSettingsTests(unittest.TestCase):
         self.assertEqual(60, response["applied"]["quality"])
         self.assertTrue(any("только работа" in reason for reason in response["reasons"]))
 
+    def test_stream_is_capped_to_physical_display_refresh(self):
+        user = {"role": "owner", "profile": "custom", "max_fps": 240}
+        server, session = self.make_server(user)
+        server._display_refresh_hz = 60
+
+        response = server._apply_stream_config(
+            session, {"fps": 120, "quality": 95, "scale": 1}, user)
+
+        self.assertEqual(120, response["selected"]["fps"])
+        self.assertEqual(60, response["applied"]["fps"])
+        self.assertEqual(60, server.capture.max_fps)
+        self.assertTrue(any("60 Гц" in reason for reason in response["reasons"]))
+
+    def test_display_change_resets_obsolete_adaptation_samples(self):
+        server, session = self.make_server({"role": "owner", "max_fps": 120})
+        session.net_degrade = 3
+        session.pipeline_degrade = 2
+        session.required_mbps = 900
+        session.encode_ms_ewma = 25
+
+        server._reset_stream_adaptation()
+
+        self.assertEqual(0, session.net_degrade)
+        self.assertEqual(0, session.pipeline_degrade)
+        self.assertEqual(0, session.required_mbps)
+        self.assertEqual(0, session.encode_ms_ewma)
+        self.assertTrue(session.force_full)
+
     def test_network_degradation_preserves_fps_before_reducing_it(self):
         _, session = self.make_server({"role": "owner", "profile": "custom",
                                        "max_fps": 120})
@@ -121,6 +149,14 @@ class StreamSettingsTests(unittest.TestCase):
         self.assertEqual(1, HostServer._pipeline_pressure_level(7.0, 8.33))
         self.assertEqual(2, HostServer._pipeline_pressure_level(9.0, 8.33))
         self.assertEqual(3, HostServer._pipeline_pressure_level(14.0, 8.33))
+
+    def test_slow_browser_ack_alone_is_not_network_pressure(self):
+        self.assertFalse(HostServer._network_lag_pressure(
+            True, 0.0002, 1 / 60, 40, 700))
+        self.assertTrue(HostServer._network_lag_pressure(
+            True, 0.012, 1 / 60, 40, 700))
+        self.assertTrue(HostServer._network_lag_pressure(
+            True, 0.0002, 1 / 60, 600, 700))
 
     def test_encoder_uses_requested_resolution_scale(self):
         width, height = 192, 144
@@ -234,6 +270,8 @@ class StreamSettingsTests(unittest.TestCase):
 class DisplayConfigTests(unittest.IsolatedAsyncioTestCase):
     async def test_allowed_session_changes_and_restores_shared_display(self):
         server = HostServer.__new__(HostServer)
+        server.config = {}
+        server._frame_evt = None
         user = {"role": "user", "profile": "dev", "max_fps": 60,
                 "allow_display": True}
         session = Session(SimpleNamespace(), "viewer", user, "127.0.0.1", "LAN Direct")

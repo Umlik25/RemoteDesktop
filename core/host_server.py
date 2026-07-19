@@ -188,9 +188,20 @@ def _diff_bbox(a, b):
         # На видео/играх почти весь экран меняется. Быстрая редкая сетка
         # позволяет сразу выбрать full-frame, не выполняя два полных прохода
         # по многомегабайтному BGRA-кадру.
-        sample = (a[::16, ::16] != b[::16, ::16]).any(axis=2)
+        sample = (a[::32, ::32] != b[::32, ::32]).any(axis=2)
         if sample.size and sample.mean() > 0.35:
             return None
+        if CV2_OK:
+            # NumPy создавал несколько временных массивов размером с кадр.
+            # На 4K это 30+ МБ на каждый проход и до 20 мс только на bbox.
+            # OpenCV выполняет точное сравнение и поиск границ внутри C/SIMD.
+            diff = cv2.absdiff(a, b)
+            unchanged = cv2.inRange(diff, (0, 0, 0, 0), (0, 0, 0, 0))
+            cv2.bitwise_not(unchanged, unchanged)
+            x0, y0, bw, bh = cv2.boundingRect(unchanged)
+            if bw <= 0 or bh <= 0:
+                return False
+            return _bbox_pad(x0, y0, x0 + bw, y0 + bh, w, h)
         rows = (a.reshape(h, -1) != b.reshape(h, -1)).any(axis=1)
         idx = np.flatnonzero(rows)
         if idx.size == 0:
@@ -707,6 +718,8 @@ class HostServer:
         self.capture = ScreenCapture()
         self.injector = InputInjector()
         self.display = display.DisplayManager()
+        initial_display = getattr(self.display, "_original", None) or {}
+        self._display_refresh_hz = int(initial_display.get("refresh") or 0)
         self._display_owner = None
         self.sessions = {}
         self.static_info = None
@@ -969,6 +982,17 @@ class HostServer:
         return 1
 
     @staticmethod
+    def _network_lag_pressure(lag_bad, send_seconds, frame_budget_seconds,
+                              required_mbps, budget_mbps):
+        """Не принимать задержку браузера за сетевой затор без подтверждения."""
+        send_busy = send_seconds > frame_budget_seconds * 1.4
+        lag_has_network_evidence = bool(
+            lag_bad and (send_seconds > frame_budget_seconds * 0.6
+                         or (budget_mbps and
+                             required_mbps > budget_mbps * 0.7)))
+        return send_busy or lag_has_network_evidence
+
+    @staticmethod
     def _pipeline_pressure_level(encode_ms, frame_budget_ms):
         """Ступень, нужная когда JPEG не укладывается в дедлайн кадра."""
         if not frame_budget_ms or encode_ms <= frame_budget_ms * 0.72:
@@ -1086,6 +1110,8 @@ class HostServer:
         try:
             current = manager.current() if available else None
             modes = manager.modes() if available else []
+            if current and current.get("refresh"):
+                self._display_refresh_hz = int(current["refresh"])
         except Exception:
             available, current, modes = False, None, []
         return {
@@ -1126,7 +1152,9 @@ class HostServer:
                     sess.desktop_size = None
                     sess.desktop_target = None
                     self.capture.restart()
-                    sess.force_full = True
+                    original = getattr(manager, "_original", None) or {}
+                    self._display_refresh_hz = int(original.get("refresh") or 0)
+                    self._reset_stream_adaptation()
                 else:
                     reasons.append("Не удалось восстановить исходное разрешение хоста")
             return self._display_state(sess, user), reasons
@@ -1168,8 +1196,9 @@ class HostServer:
         sess.desktop_mode = requested
         sess.desktop_size = chosen
         sess.desktop_target = target
+        self._display_refresh_hz = int(chosen.get("refresh") or 0)
         self.capture.restart()
-        sess.force_full = True
+        self._reset_stream_adaptation()
         if chosen["width"] != width or chosen["height"] != height:
             reasons.append(
                 f"Применён ближайший поддерживаемый режим {chosen['width']}×{chosen['height']} "
@@ -1197,6 +1226,9 @@ class HostServer:
             try:
                 await asyncio.get_running_loop().run_in_executor(_executor, manager.restore)
                 self.capture.restart()
+                original = getattr(manager, "_original", None) or {}
+                self._display_refresh_hz = int(original.get("refresh") or 0)
+                self._reset_stream_adaptation()
             except Exception:
                 pass
         self._display_owner = None
@@ -1248,6 +1280,11 @@ class HostServer:
             why.append(
                 f"Захват или JPEG не укладываются в целевой FPS "
                 f"(ступень {sess.pipeline_degrade})")
+        refresh = int(getattr(self, "_display_refresh_hz", 0) or 0)
+        if refresh >= 24 and sess.fps > refresh:
+            why.append(
+                f"Дисплей хоста работает на {refresh} Гц, поэтому поток "
+                f"ограничен до {refresh} FPS")
         # Не дублируем одинаковые причины между валидацией и текущим состоянием.
         why = list(dict.fromkeys(why))
         return {
@@ -1319,9 +1356,25 @@ class HostServer:
     def _stream_params(self, sess):
         """Эффективные FPS/качество/масштаб с учётом режима «только работа»."""
         fps, q, s = sess.effective()
+        refresh = int(getattr(self, "_display_refresh_hz", 0) or 0)
+        if refresh >= 24:
+            fps = min(fps, refresh)
         if self.config.get("work_only_mode") and sess.user.get("role") not in ("owner", "admin"):
             fps, q = min(fps, 30), min(q, 60)
         return fps, q, s
+
+    def _reset_stream_adaptation(self):
+        """Сбросить замеры, ставшие неверными после смены display mode."""
+        for session in self.sessions.values():
+            session.net_degrade = 0
+            session.pipeline_degrade = 0
+            session.frame_bytes_ewma = 0.0
+            session.required_mbps = 0.0
+            session.encode_ms_ewma = 0.0
+            session.send_ms_ewma = 0.0
+            session.force_full = True
+        self._refresh_capture_fps()
+        self._notify_frame()
 
     def _refresh_capture_fps(self):
         targets = [self._stream_params(s)[0] for s in self.sessions.values()]
@@ -1943,8 +1996,10 @@ class HostServer:
             sess.encode_ms_ewma = (encode_ms if not sess.encode_ms_ewma
                                    else sess.encode_ms_ewma * 0.75 + encode_ms * 0.25)
             now_encoded = time.monotonic()
+            pipeline_ms = max(sess.encode_ms_ewma,
+                              float(getattr(self.capture, "process_ms_ewma", 0.0)))
             pipeline_level = self._pipeline_pressure_level(
-                sess.encode_ms_ewma, budget * 1000)
+                pipeline_ms, budget * 1000)
             if sess.adaptive:
                 if pipeline_level:
                     pipeline_pressure_since = pipeline_pressure_since or now_encoded
@@ -2035,6 +2090,8 @@ class HostServer:
                 bandwidth_bad = bool(pressure_since and now2 - pressure_since >= 0.8)
                 bandwidth_good = bool(not budget_mbps
                                       or sess.required_mbps < budget_mbps * 0.7)
+                lag_is_network = self._network_lag_pressure(
+                    lag_bad, send_ewma, budget, sess.required_mbps, budget_mbps)
                 if bandwidth_bad and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
                     # Q95/120 FPS на 100-Мбит порту может превышать безопасный
                     # бюджет в 3–5 раз. Прыгаем сразу к расчётной ступени, иначе
@@ -2047,7 +2104,8 @@ class HostServer:
                 elif send_dt > max(0.25, budget * 4) and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
                     sess.net_degrade += 1  # резкий затык канала — реагируем сразу
                     last_adapt = now2
-                elif (lag_bad or send_ewma > budget * 1.4) and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
+                elif (lag_is_network and sess.net_degrade < 3
+                      and now2 - last_adapt > 2.0):
                     sess.net_degrade += 1
                     last_adapt = now2
                 elif (lag_good and bandwidth_good and send_ewma < budget * 0.4
