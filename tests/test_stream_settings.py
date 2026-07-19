@@ -185,6 +185,18 @@ class StreamSettingsTests(unittest.TestCase):
 
         self.assertEqual((1920, 1200), (chosen["width"], chosen["height"]))
 
+    def test_smooth_display_mode_avoids_4k_for_retina_client(self):
+        modes = [
+            {"width": 3840, "height": 2160, "refresh": 60},
+            {"width": 2560, "height": 1440, "refresh": 60},
+            {"width": 1920, "height": 1200, "refresh": 60},
+            {"width": 1920, "height": 1080, "refresh": 120},
+        ]
+
+        chosen = best_mode(modes, 3456, 2234, max_pixels=2_500_000)
+
+        self.assertEqual((1920, 1200), (chosen["width"], chosen["height"]))
+
     def test_display_manager_is_safely_disabled_off_windows(self):
         with mock.patch("core.display.IS_WIN", False):
             manager = DisplayManager()
@@ -296,19 +308,46 @@ class DisplayConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("client", state["mode"])
         self.assertEqual(session.sid, server._display_owner)
         self.assertTrue(any("1920×1200" in reason for reason in reasons))
-        manager.set_best.assert_called_once_with(3456, 2234)
+        manager.set_best.assert_called_once_with(3456, 2234, None)
         server.capture.restart.assert_called_once()
 
         await server._apply_display_config(session, {
             "desktop_mode": "client", "client_width": 3456, "client_height": 2234,
         }, user)
-        manager.set_best.assert_called_once_with(3456, 2234)
+        manager.set_best.assert_called_once_with(3456, 2234, None)
         server.capture.restart.assert_called_once()
 
         await server._release_display(session)
         manager.restore.assert_called_once()
         self.assertIsNone(server._display_owner)
 
+    async def test_high_fps_client_desktop_uses_capture_pixel_budget(self):
+        server = HostServer.__new__(HostServer)
+        server.config = {}
+        server._frame_evt = None
+        user = {"role": "owner", "profile": "custom", "max_fps": 240}
+        session = Session(SimpleNamespace(), "owner", user, "127.0.0.1", "LAN Direct")
+        chosen = {"width": 1920, "height": 1200, "refresh": 60}
+        manager = SimpleNamespace(
+            available=True,
+            current=lambda: {"width": 3840, "height": 2160, "refresh": 60},
+            modes=lambda: [
+                {"width": 3840, "height": 2160, "refresh": 60}, chosen],
+            set_best=mock.Mock(return_value=(True, chosen, None)),
+        )
+        server.display = manager
+        server.capture = SimpleNamespace(max_fps=30, restart=mock.Mock())
+        server.sessions = {session.sid: session}
+        server._display_owner = None
+
+        state, reasons = await server._apply_display_config(session, {
+            "desktop_mode": "client", "fps": 120,
+            "client_display": {"screen": {"width": 3456, "height": 2234}},
+        }, user)
+
+        self.assertEqual(chosen, state["selected"])
+        manager.set_best.assert_called_once_with(3456, 2234, 2_500_000)
+        self.assertTrue(any("стабильных 120 FPS" in reason for reason in reasons))
 
 class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_distinct_precise_scales_do_not_share_encoded_cache(self):

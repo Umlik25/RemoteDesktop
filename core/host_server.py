@@ -150,6 +150,11 @@ PRIORITY_ORDER = {"low": 0, "normal": 1, "high": 2, "critical": 3}
 LOGIN_ATTEMPT_LIMIT = 8
 LOGIN_ATTEMPT_WINDOW = 60
 MAX_UPLOAD_MB = 256
+SMOOTH_DESKTOP_MIN_FPS = 50
+# MJPEG кодируется процессором. Около 2.5 Мп оставляют достаточно времени для
+# DXGI-захвата и JPEG при 60 FPS; 4K в этом протоколе стабильно не помещается в
+# 16.7-мс дедлайн даже в быстрой локальной сети.
+SMOOTH_DESKTOP_MAX_PIXELS = 2_500_000
 
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -196,9 +201,13 @@ def _diff_bbox(a, b):
             # На 4K это 30+ МБ на каждый проход и до 20 мс только на bbox.
             # OpenCV выполняет точное сравнение и поиск границ внутри C/SIMD.
             diff = cv2.absdiff(a, b)
-            unchanged = cv2.inRange(diff, (0, 0, 0, 0), (0, 0, 0, 0))
-            cv2.bitwise_not(unchanged, unchanged)
-            x0, y0, bw, bh = cv2.boundingRect(unchanged)
+            # boundingRect принимает одноканальную матрицу. Представляем BGRA
+            # как строку байтов и переводим найденные X обратно в пиксели. Это
+            # убирает ещё одну 4K-маску и два полных прохода inRange/invert.
+            byte_x, y0, byte_w, bh = cv2.boundingRect(diff.reshape(h, w * 4))
+            x0 = byte_x // 4
+            x1 = (byte_x + byte_w + 3) // 4
+            bw = x1 - x0
             if bw <= 0 or bh <= 0:
                 return False
             return _bbox_pad(x0, y0, x0 + bw, y0 + bh, w, h)
@@ -1172,13 +1181,18 @@ class HostServer:
             return self._display_state(sess, user), reasons
         width = int(max(800, min(8192, raw_width)))
         height = int(max(600, min(8192, raw_height)))
+        requested_fps = int(round(self._stream_number(data.get("fps"), sess.fps)))
+        pixel_budget = (SMOOTH_DESKTOP_MAX_PIXELS
+                        if requested_fps >= SMOOTH_DESKTOP_MIN_FPS else None)
         try:
-            candidate = display.best_mode(manager.modes(), width, height)
+            candidate = display.best_mode(
+                manager.modes(), width, height, max_pixels=pixel_budget)
         except Exception:
             candidate = None
         selected = sess.desktop_size or {}
         target = {"width": width, "height": height,
-                  "source": "window" if requested == "viewport" else "screen"}
+                  "source": "window" if requested == "viewport" else "screen",
+                  "max_pixels": pixel_budget}
         if (display_owner == sess.sid and candidate
                 and selected.get("width") == candidate.get("width")
                 and selected.get("height") == candidate.get("height")):
@@ -1187,7 +1201,7 @@ class HostServer:
             return self._display_state(sess, user), reasons
         try:
             ok, chosen, error = await asyncio.get_running_loop().run_in_executor(
-                _executor, manager.set_best, width, height)
+                _executor, manager.set_best, width, height, pixel_budget)
         except Exception as exc:
             ok, chosen, error = False, None, f"Ошибка Windows Display API: {exc}"
         if not ok:
@@ -1200,6 +1214,12 @@ class HostServer:
         self._display_refresh_hz = int(chosen.get("refresh") or 0)
         self.capture.restart()
         self._reset_stream_adaptation()
+        if (pixel_budget and width * height > pixel_budget
+                and chosen["width"] * chosen["height"] <= pixel_budget):
+            reasons.append(
+                f"Для стабильных {requested_fps} FPS системное разрешение "
+                f"ограничено до {chosen['width']}×{chosen['height']}; "
+                "4K в текущем MJPEG-режиме перегружает захват и JPEG")
         if chosen["width"] != width or chosen["height"] != height:
             reasons.append(
                 f"Применён ближайший поддерживаемый режим {chosen['width']}×{chosen['height']} "

@@ -12,10 +12,22 @@ import threading
 IS_WIN = platform.system() == "Windows"
 
 
-def best_mode(modes, target_width, target_height):
-    """Ближайший режим по aspect ratio, затем по числу пикселей."""
+def best_mode(modes, target_width, target_height, max_pixels=None):
+    """Ближайший режим по aspect ratio, затем по числу пикселей.
+
+    max_pixels используется потоковым режимом: Retina-клиент не должен
+    неявно переключать Windows в 4K, если захвату нужен стабильный 60 FPS.
+    """
     if not modes or target_width < 1 or target_height < 1:
         return None
+    candidates = list(modes)
+    if max_pixels:
+        within_budget = [
+            mode for mode in candidates
+            if mode["width"] * mode["height"] <= int(max_pixels)
+        ]
+        if within_budget:
+            candidates = within_budget
     target_aspect = target_width / target_height
     target_area = target_width * target_height
 
@@ -26,7 +38,7 @@ def best_mode(modes, target_width, target_height):
         # Геометрия важнее абсолютного числа пикселей: меньше чёрных полос.
         return aspect_error * 8 + area_error, -mode.get("refresh", 0)
 
-    return min(modes, key=score)
+    return min(candidates, key=score)
 
 
 if IS_WIN:
@@ -199,14 +211,15 @@ class DisplayManager:
                 return False, f"Не удалось сменить разрешение Windows (код {result})"
             return True, None
 
-    def set_best(self, target_width, target_height):
+    def set_best(self, target_width, target_height, max_pixels=None):
         # Рассматриваем только режимы не крупнее исходного (проверенно-рабочего)
         # режима монитора — иначе рискуем выставить то, что монитор не покажет.
         orig = self._original or {}
         ow = orig.get("width", 1 << 30)
         oh = orig.get("height", 1 << 30)
         safe = [m for m in self.modes() if m["width"] <= ow and m["height"] <= oh]
-        chosen = best_mode(safe, int(target_width), int(target_height))
+        chosen = best_mode(
+            safe, int(target_width), int(target_height), max_pixels=max_pixels)
         if not chosen:
             return False, None, "Поддерживаемые режимы дисплея не найдены"
         ok, error = self.set_mode(chosen["width"], chosen["height"], chosen.get("refresh", 0))
