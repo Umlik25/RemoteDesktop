@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "host_name": None,            # отображаемое имя хоста
     "node_type": "auto",         # "auto" | "physical" | "vm"
     "parent_host": None,          # имя физического хоста для VM (необязательно)
+    "display_output": "auto",   # auto предпочитает независимый IDD-дисплей
     "host_port": 8532,            # HTTP/WS порт хоста
     "discovery_port": 8533,       # UDP порт LAN-обнаружения
     "client_port": 8600,          # локальная панель клиента

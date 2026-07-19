@@ -18,12 +18,23 @@ class VideoEncoderTests(unittest.TestCase):
         cmd = video_encoder.command(capabilities, 60, 70, 3840, 2160, 700)
         joined = " ".join(cmd)
 
-        self.assertIn("ddagrab=framerate=60:draw_mouse=0", joined)
+        self.assertIn("ddagrab=output_idx=0:framerate=60:draw_mouse=0", joined)
         self.assertIn("-c:v h264_nvenc", joined)
         self.assertIn("-tune ull", joined)
         self.assertIn("-bf 0", joined)
         self.assertIn("frag_every_frame", joined)
         self.assertEqual("pipe:1", cmd[-1])
+
+    def test_nvenc_selects_requested_dxgi_device_and_output(self):
+        capabilities = {"available": True, "executable": "ffmpeg"}
+
+        cmd = video_encoder.command(
+            capabilities, 120, 70, 2560, 1440, 700, output_idx=2, device_idx=1)
+        joined = " ".join(cmd)
+
+        self.assertIn("-init_hw_device d3d11va=grab:1", joined)
+        self.assertIn("-filter_hw_device grab", joined)
+        self.assertIn("ddagrab=output_idx=2:framerate=120", joined)
 
     def test_unavailable_encoder_rejects_command(self):
         with self.assertRaises(ValueError):

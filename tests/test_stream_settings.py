@@ -6,8 +6,8 @@ from unittest import mock
 from PIL import Image
 
 from core import capability
-from core.host_server import HostServer, InputInjector, Session, encode_jpeg
-from core.display import DisplayManager, best_mode
+from core.host_server import HostServer, InputInjector, ScreenCapture, Session, encode_jpeg
+from core.display import DisplayManager, best_mode, is_virtual_output
 
 
 class StreamSettingsTests(unittest.TestCase):
@@ -230,6 +230,50 @@ class StreamSettingsTests(unittest.TestCase):
         with mock.patch("core.display.IS_WIN", False):
             manager = DisplayManager()
         self.assertFalse(manager.available)
+
+    def test_virtual_display_markers_cover_supported_idd_drivers(self):
+        self.assertTrue(is_virtual_output("Virtual Display Driver", "ROOT\\MTTVDD"))
+        self.assertTrue(is_virtual_output("Generic Monitor", "DISPLAY\\MTT1337"))
+        self.assertFalse(is_virtual_output("NVIDIA GeForce RTX 3060", "DISPLAY\\DEL1234"))
+
+    def test_virtual_display_modes_are_not_capped_by_physical_original(self):
+        mgr = DisplayManager.__new__(DisplayManager)
+        mgr._outputs = []
+        mgr._original = {"width": 1366, "height": 768, "refresh": 60, "bpp": 32}
+        mgr.selected_output = lambda: {"virtual": True}
+        mgr.modes = lambda: [
+            {"width": 3840, "height": 2160, "refresh": 120, "bpp": 32},
+            {"width": 1920, "height": 1080, "refresh": 120, "bpp": 32},
+        ]
+        requested = {}
+
+        def fake_set_mode(width, height, refresh=0):
+            requested["mode"] = (width, height, refresh)
+            return True, None
+
+        mgr.set_mode = fake_set_mode
+        ok, chosen, error = mgr.set_best(3840, 2160)
+
+        self.assertTrue(ok, error)
+        self.assertEqual((3840, 2160, 120), requested["mode"])
+        self.assertEqual(3840, chosen["width"])
+
+    def test_capture_and_mouse_use_selected_monitor_coordinates(self):
+        capture = ScreenCapture()
+        changed = capture.select_output({
+            "id": "\\\\.\\DISPLAY3", "device_index": 1, "output_index": 2,
+            "current": {"x": -2560, "y": 0, "width": 2560, "height": 1440},
+        })
+        self.assertTrue(changed)
+        self.assertEqual((1, 2), (capture.device_idx, capture.output_idx))
+        self.assertEqual((-2560, 0), capture.mon_offset)
+
+        injector = InputInjector.__new__(InputInjector)
+        injector.mouse = SimpleNamespace(position=(0, 0))
+        injector.set_screen(2560, 1440, (-2560, 0))
+        with mock.patch("core.host_server._SENDINPUT_OK", False):
+            injector._mouse_move(0.5, 0.5)
+        self.assertEqual((-1281, 719), injector.mouse.position)
 
     def test_set_best_never_exceeds_original_monitor_mode(self):
         # Монитор по D-SUB не синхронизирует режимы крупнее исходного, даже если

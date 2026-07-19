@@ -91,22 +91,34 @@ def target_bitrate_mbps(width, height, fps, quality, safe_network_mbps=0):
     return max(3, min(200, int(round(target))))
 
 
-def command(capabilities, fps, quality, width, height, safe_network_mbps=0):
+def command(capabilities, fps, quality, width, height, safe_network_mbps=0,
+            output_idx=0, device_idx=0):
     executable = capabilities.get("executable")
     if not capabilities.get("available") or not executable:
         raise ValueError(capabilities.get("reason") or "Аппаратный H.264 недоступен")
     fps = max(1, min(240, int(fps)))
     bitrate = target_bitrate_mbps(
         width, height, fps, quality, safe_network_mbps)
+    output_idx = max(0, int(output_idx))
+    device_idx = max(0, int(device_idx))
     # frag_every_frame не ждёт GOP перед передачей сегмента. B-кадры и lookahead
     # выключены: задержка важнее небольшой экономии битрейта.
-    return [
+    command_line = [
         executable, "-hide_banner", "-loglevel", "warning", "-nostdin",
-        "-f", "lavfi", "-i", f"ddagrab=framerate={fps}:draw_mouse=0",
+    ]
+    if device_idx:
+        command_line.extend([
+            "-init_hw_device", f"d3d11va=grab:{device_idx}",
+            "-filter_hw_device", "grab",
+        ])
+    command_line.extend([
+        "-f", "lavfi", "-i",
+        f"ddagrab=output_idx={output_idx}:framerate={fps}:draw_mouse=0",
         "-an", "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull",
         "-rc", "cbr", "-b:v", f"{bitrate}M", "-maxrate", f"{bitrate}M",
         "-bufsize", f"{max(2, bitrate // 2)}M", "-g", str(fps),
         "-keyint_min", str(fps), "-bf", "0", "-profile:v", "high",
         "-movflags", "+frag_every_frame+empty_moov+default_base_moof+omit_tfhd_offset",
         "-flush_packets", "1", "-f", "mp4", "pipe:1",
-    ]
+    ])
+    return command_line

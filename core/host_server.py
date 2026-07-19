@@ -29,7 +29,7 @@ from urllib.parse import quote, urlsplit
 import psutil
 from aiohttp import web, WSMsgType
 
-from . import auth, capability, display, hwinfo, state, video_encoder
+from . import auth, capability, display, hwinfo, state, video_encoder, virtual_display
 
 try:
     import mss
@@ -126,7 +126,8 @@ if _user32 is not None:
 
         _user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
         _user32.SendInput.restype = ctypes.c_uint
-        _MEF = {"move": 0x0001, "abs": 0x8000, "ldown": 0x0002, "lup": 0x0004,
+        _MEF = {"move": 0x0001, "abs": 0x8000, "virtualdesk": 0x4000,
+                "ldown": 0x0002, "lup": 0x0004,
                 "rdown": 0x0008, "rup": 0x0010, "mdown": 0x0020, "mup": 0x0040,
                 "xdown": 0x0080, "xup": 0x0100, "wheel": 0x0800, "hwheel": 0x1000}
         _SENDINPUT_OK = True
@@ -236,6 +237,10 @@ class ScreenCapture:
         self.running = False
         self.max_fps = 30
         self.mon_offset = (0, 0)   # left/top захватываемого монитора
+        self.monitor_rect = None    # {x,y,width,height} выбранного Windows output
+        self.output_id = None
+        self.device_idx = 0
+        self.output_idx = 0
         self.backend = None        # "dxgi" | "gdi"
         self.on_frame = None       # колбэк «появился новый кадр» (из потока захвата)
         self.bbox_ring = collections.deque(maxlen=600)   # (seq, bbox|None)
@@ -260,6 +265,29 @@ class ScreenCapture:
         """Пересоздать DXGI/GDI после смены display mode."""
         self.bbox_ring.clear()
         self._restart.set()
+
+    def select_output(self, output):
+        """Point every capture backend at the same enumerated Windows output."""
+        output = output or {}
+        current = output.get("current") or {}
+        new_state = (
+            output.get("id"), int(output.get("device_index", 0) or 0),
+            int(output.get("output_index", output.get("capture_index", 0)) or 0),
+            int(current.get("x", 0) or 0), int(current.get("y", 0) or 0),
+            int(current.get("width", 0) or 0), int(current.get("height", 0) or 0),
+        )
+        old_state = (
+            self.output_id, self.device_idx, self.output_idx,
+            *((self.monitor_rect or {}).get(key, 0)
+              for key in ("x", "y", "width", "height")),
+        )
+        self.output_id, self.device_idx, self.output_idx = new_state[:3]
+        self.monitor_rect = dict(zip(("x", "y", "width", "height"), new_state[3:]))
+        self.mon_offset = (new_state[3], new_state[4])
+        if new_state != old_state:
+            self.frame = None
+            self.restart()
+        return new_state != old_state
 
     def bbox_since(self, since_seq, upto_seq):
         """Объединённая область изменений за (since_seq, upto_seq].
@@ -318,14 +346,17 @@ class ScreenCapture:
         """DXGI Desktop Duplication: быстрый захват, grab() сам возвращает None,
         если экран не менялся. Возврат False -> откат на mss."""
         try:
-            cam = dxcam.create(output_color="BGRA")
+            cam = dxcam.create(device_idx=self.device_idx, output_idx=self.output_idx,
+                               output_color="BGRA")
             if cam is None:
                 return False
         except Exception:
             return False
-        print("[App_Remote] Захват экрана: DXGI Desktop Duplication (быстрый)")
+        print(f"[App_Remote] Захват экрана: DXGI device {self.device_idx}, "
+              f"output {self.output_idx} (быстрый)")
         self.backend = "dxgi"
-        self.mon_offset = (0, 0)   # dxcam захватывает основной монитор с (0,0)
+        rect = self.monitor_rect or {}
+        self.mon_offset = (int(rect.get("x", 0)), int(rect.get("y", 0)))
         errors = 0
         prev = None
         try:
@@ -384,7 +415,17 @@ class ScreenCapture:
         self.backend = "gdi"
         print("[App_Remote] Захват экрана: GDI/mss (запасной путь)")
         with mss.mss() as sct:
-            mon = sct.monitors[1]
+            monitors = list(sct.monitors[1:])
+            rect = self.monitor_rect or {}
+            mon = next((item for item in monitors
+                        if int(item.get("left", 0)) == int(rect.get("x", 0))
+                        and int(item.get("top", 0)) == int(rect.get("y", 0))
+                        and int(item.get("width", 0)) == int(rect.get("width", 0))
+                        and int(item.get("height", 0)) == int(rect.get("height", 0))), None)
+            if mon is None and monitors:
+                mon = monitors[min(max(0, self.output_idx), len(monitors) - 1)]
+            if mon is None:
+                return
             self.mon_offset = (mon.get("left", 0), mon.get("top", 0))
             next_tick = time.perf_counter()
             while self.running and not self._restart.is_set():
@@ -516,15 +557,42 @@ class InputInjector:
         self.mouse = MouseController() if INPUT_OK else None
         self.kb = KeyController() if INPUT_OK else None
         self.screen_wh = None
+        self.screen_origin = (0, 0)
+
+    def set_screen(self, width, height, origin=(0, 0)):
+        self.screen_wh = (max(1, int(width)), max(1, int(height)))
+        self.screen_origin = (int(origin[0]), int(origin[1]))
+
+    def _absolute_target(self, nx, ny):
+        width, height = self.screen_wh or (1, 1)
+        origin = getattr(self, "screen_origin", (0, 0))
+        return (origin[0] + int(nx * max(0, width - 1)),
+                origin[1] + int(ny * max(0, height - 1)))
+
+    def _send_absolute(self, x, y):
+        if not _SENDINPUT_OK:
+            return False
+        if _user32 is not None:
+            try:
+                left = int(_user32.GetSystemMetrics(76))   # SM_XVIRTUALSCREEN
+                top = int(_user32.GetSystemMetrics(77))    # SM_YVIRTUALSCREEN
+                width = max(1, int(_user32.GetSystemMetrics(78)))
+                height = max(1, int(_user32.GetSystemMetrics(79)))
+                dx = round((int(x) - left) * 65535 / max(1, width - 1))
+                dy = round((int(y) - top) * 65535 / max(1, height - 1))
+                flags = _MEF["move"] | _MEF["abs"] | _MEF["virtualdesk"]
+                return bool(_send_mouse(flags, max(0, min(65535, dx)),
+                                        max(0, min(65535, dy))))
+            except Exception:
+                pass
+        return False
 
     def _mouse_move(self, nx, ny):
-        """nx,ny в 0..1. SendInput (абсолют, 0..65535) — если доступен; иначе pynput."""
-        if _SENDINPUT_OK and _send_mouse(_MEF["move"] | _MEF["abs"],
-                                         int(nx * 65535), int(ny * 65535)):
+        """Map normalized coordinates into the selected monitor's desktop rect."""
+        x, y = self._absolute_target(nx, ny)
+        if self._send_absolute(x, y):
             return
-        if self.screen_wh:
-            x = int(nx * (self.screen_wh[0] - 1))
-            y = int(ny * (self.screen_wh[1] - 1))
+        if self.screen_wh and self.mouse:
             self.mouse.position = (x, y)
 
     def _mouse_move_relative(self, dx, dy):
@@ -540,16 +608,22 @@ class InputInjector:
             try:
                 x, y = self.mouse.position
                 w, h = self.screen_wh
-                nx = max(0, min(w - 1, int(x) + dx)) / max(1, w - 1)
-                ny = max(0, min(h - 1, int(y) + dy)) / max(1, h - 1)
-                if _send_mouse(_MEF["move"] | _MEF["abs"],
-                               int(nx * 65535), int(ny * 65535)):
+                ox, oy = getattr(self, "screen_origin", (0, 0))
+                target_x = max(ox, min(ox + w - 1, int(x) + dx))
+                target_y = max(oy, min(oy + h - 1, int(y) + dy))
+                if self._send_absolute(target_x, target_y):
                     return
             except Exception:
                 pass
         if self.mouse:
             x, y = self.mouse.position
-            self.mouse.position = (int(x) + dx, int(y) + dy)
+            target_x, target_y = int(x) + dx, int(y) + dy
+            if self.screen_wh:
+                width, height = self.screen_wh
+                ox, oy = getattr(self, "screen_origin", (0, 0))
+                target_x = max(ox, min(ox + width - 1, target_x))
+                target_y = max(oy, min(oy + height - 1, target_y))
+            self.mouse.position = (target_x, target_y)
 
     def _mouse_button(self, b, down):
         if _SENDINPUT_OK:
@@ -734,7 +808,8 @@ class HostServer:
         self.config = config
         self.capture = ScreenCapture()
         self.injector = InputInjector()
-        self.display = display.DisplayManager()
+        self.display = display.DisplayManager(config.get("display_output", "auto"))
+        self._sync_capture_output()
         initial_display = getattr(self.display, "_original", None) or {}
         self._display_refresh_hz = int(initial_display.get("refresh") or 0)
         self._display_owner = None
@@ -803,6 +878,7 @@ class HostServer:
         r.add_get("/api/sessions", self.api_sessions)
         r.add_post("/api/sessions/kick", self.api_kick)
         r.add_post("/api/settings", self.api_settings)
+        r.add_post("/api/display/install", self.api_display_install)
         r.add_post("/api/app/role", self.api_app_role)
         r.add_get("/api/audit", self.api_audit)
         r.add_get("/api/history", self.api_history)
@@ -827,7 +903,8 @@ class HostServer:
                     break
                 await asyncio.sleep(0.1)
             if self.capture.frame:
-                self.injector.screen_wh = (self.capture.frame[1], self.capture.frame[2])
+                self.injector.set_screen(
+                    self.capture.frame[1], self.capture.frame[2], self.capture.mon_offset)
         asyncio.create_task(self._beacon_loop())
         asyncio.create_task(self._governor_loop())
         state.audit("host.start", "system", {"port": self.config["host_port"]})
@@ -1028,13 +1105,31 @@ class HostServer:
         """Из потока захвата: разбудить отправителей кадров в event loop."""
         frame = self.capture.frame
         if frame:
-            self.injector.screen_wh = (frame[1], frame[2])
+            self.injector.set_screen(frame[1], frame[2], self.capture.mon_offset)
         loop = self._loop
         if loop is not None:
             try:
                 loop.call_soon_threadsafe(self._notify_frame)
             except RuntimeError:
                 pass
+
+    def _sync_capture_output(self, output=None):
+        manager = getattr(self, "display", None)
+        if output is None and manager:
+            try:
+                output = manager.selected_output()
+            except Exception:
+                output = None
+        capture = getattr(self, "capture", None)
+        if capture and hasattr(capture, "select_output"):
+            capture.select_output(output)
+        current = (output or {}).get("current") or {}
+        injector = getattr(self, "injector", None)
+        if injector and current:
+            injector.set_screen(
+                current.get("width", 1), current.get("height", 1),
+                (current.get("x", 0), current.get("y", 0)))
+        return output
 
     def _notify_frame(self):
         ev = self._frame_evt
@@ -1130,10 +1225,13 @@ class HostServer:
         try:
             current = manager.current() if available else None
             modes = manager.modes() if available else []
+            outputs = manager.outputs() if available and hasattr(manager, "outputs") else []
+            selected_output = (manager.selected_output()
+                               if available and hasattr(manager, "selected_output") else None)
             if current and current.get("refresh"):
                 self._display_refresh_hz = int(current["refresh"])
         except Exception:
-            available, current, modes = False, None, []
+            available, current, modes, outputs, selected_output = False, None, [], [], None
         return {
             "available": available,
             "allowed": available and allowed,
@@ -1143,13 +1241,82 @@ class HostServer:
             "target": sess.desktop_target if sess else None,
             "modes": modes,
             "shared": True,
+            "output": selected_output,
+            "outputs": outputs,
+            "independent_from_physical": bool(
+                selected_output and selected_output.get("virtual")),
+            "virtual_display": virtual_display.state_payload(outputs),
         }
 
+    async def _apply_display_output_config(self, sess, data, user):
+        requested = data.get("display_output")
+        if not requested:
+            return []
+        manager = getattr(self, "display", None)
+        allowed = bool(user and (user.get("role") in ("owner", "admin")
+                                 or user.get("allow_display", False)))
+        if not manager or not manager.available:
+            return ["Выбор экрана доступен только на Windows-хосте"]
+        if not allowed:
+            return ["Владелец хоста не разрешил этой учётной записи менять дисплей"]
+        try:
+            before = manager.selected_output() if hasattr(manager, "selected_output") else None
+            outputs = manager.outputs() if hasattr(manager, "outputs") else []
+        except Exception:
+            before, outputs = None, []
+        lowered = str(requested).lower()
+        if lowered == "virtual":
+            target = next((item for item in outputs if item.get("virtual")), None)
+        elif lowered == "physical":
+            target = next((item for item in outputs
+                           if item.get("primary") and not item.get("virtual")), None)
+            target = target or next((item for item in outputs if not item.get("virtual")), None)
+        elif lowered == "auto":
+            target = next((item for item in outputs if item.get("virtual")), None)
+            target = target or next((item for item in outputs if item.get("primary")), None)
+        else:
+            target = next((item for item in outputs if item.get("id") == requested), None)
+        changing = bool(target and before and target.get("id") != before.get("id"))
+        if changing and len(self.sessions) > 1:
+            return ["Экран трансляции нельзя переключать при нескольких активных сессиях"]
+        display_owner = getattr(self, "_display_owner", None)
+        if changing and display_owner not in (None, sess.sid):
+            return ["Разрешением текущего экрана управляет другая сессия"]
+        if changing and display_owner == sess.sid:
+            try:
+                await asyncio.get_running_loop().run_in_executor(_executor, manager.restore)
+            except Exception:
+                pass
+            self._display_owner = None
+            sess.desktop_mode = "host"
+            sess.desktop_size = None
+            sess.desktop_target = None
+        try:
+            ok, selected, error = await asyncio.get_running_loop().run_in_executor(
+                _executor, manager.select_output, requested)
+        except Exception as exc:
+            ok, selected, error = False, None, f"Ошибка Windows Display API: {exc}"
+        if not ok or not selected:
+            return [error or "Windows не смогла выбрать экран трансляции"]
+        if not before or selected.get("id") != before.get("id"):
+            self.config["display_output"] = str(requested)
+            state.save_config(self.config)
+            self._sync_capture_output(selected)
+            current = selected.get("current") or {}
+            self._display_refresh_hz = int(current.get("refresh") or 0)
+            self._reset_stream_adaptation()
+            for active in self.sessions.values():
+                active.codec_generation += 1
+                active.force_full = True
+            state.audit("display.output", sess.username, {
+                "id": selected.get("id"), "virtual": selected.get("virtual", False)})
+        return []
+
     async def _apply_display_config(self, sess, data, user):
+        reasons = await self._apply_display_output_config(sess, data, user)
         requested = data.get("desktop_mode")
         if requested not in ("host", "client", "viewport"):
-            return self._display_state(sess, user), []
-        reasons = []
+            return self._display_state(sess, user), reasons
         manager = getattr(self, "display", None)
         allowed = bool(user and (user.get("role") in ("owner", "admin")
                                  or user.get("allow_display", False)))
@@ -1171,6 +1338,7 @@ class HostServer:
                     sess.desktop_mode = "host"
                     sess.desktop_size = None
                     sess.desktop_target = None
+                    self._sync_capture_output()
                     self.capture.restart()
                     original = getattr(manager, "_original", None) or {}
                     self._display_refresh_hz = int(original.get("refresh") or 0)
@@ -1226,6 +1394,7 @@ class HostServer:
         sess.desktop_size = chosen
         sess.desktop_target = target
         self._display_refresh_hz = int(chosen.get("refresh") or 0)
+        self._sync_capture_output()
         self.capture.restart()
         self._reset_stream_adaptation()
         if (pixel_budget and width * height > pixel_budget
@@ -1260,6 +1429,7 @@ class HostServer:
         if manager and manager.available:
             try:
                 await asyncio.get_running_loop().run_in_executor(_executor, manager.restore)
+                self._sync_capture_output()
                 self.capture.restart()
                 original = getattr(manager, "_original", None) or {}
                 self._display_refresh_hz = int(original.get("refresh") or 0)
@@ -1290,6 +1460,7 @@ class HostServer:
         sess.desktop_size = chosen
         sess.desktop_target = {**target, "max_pixels": SMOOTH_DESKTOP_MAX_PIXELS}
         self._display_refresh_hz = int(chosen.get("refresh") or 0)
+        self._sync_capture_output()
         self.capture.restart()
         self._reset_stream_adaptation()
         return chosen
@@ -1585,6 +1756,7 @@ class HostServer:
             "gpus": s.get("gpus"),
             "encoders": s.get("encoders"),
             "video": self._public_video_capabilities(),
+            "display": self._display_state(),
             "network": self._network_state(),
             "accepting": self.config.get("accepting", True),
             "input_ok": INPUT_OK,
@@ -1923,9 +2095,48 @@ class HostServer:
             if len(parent) > 64 or any(ord(ch) < 32 for ch in parent):
                 raise web.HTTPBadRequest(text="Имя физического хоста должно быть короче 65 символов")
             self.config["parent_host"] = parent or None
+        if "display_output" in d:
+            requested_output = str(d["display_output"] or "auto")
+            before = (self.display.selected_output()
+                      if hasattr(self.display, "selected_output") else None)
+            if self.sessions:
+                outputs = self.display.outputs() if hasattr(self.display, "outputs") else []
+                target = next((item for item in outputs
+                               if item.get("id") == requested_output), None)
+                if requested_output == "virtual":
+                    target = next((item for item in outputs if item.get("virtual")), None)
+                elif requested_output == "physical":
+                    target = next((item for item in outputs if not item.get("virtual")), None)
+                elif requested_output == "auto":
+                    target = next((item for item in outputs if item.get("virtual")), None)
+                    target = target or next((item for item in outputs if item.get("primary")), None)
+                if target and before and target.get("id") != before.get("id"):
+                    raise web.HTTPConflict(text="Отключите активные сессии перед сменой экрана")
+            ok, selected, error = await asyncio.get_running_loop().run_in_executor(
+                _executor, self.display.select_output, requested_output)
+            if not ok:
+                raise web.HTTPBadRequest(text=error or "Не удалось выбрать экран")
+            self.config["display_output"] = requested_output
+            self._sync_capture_output(selected)
+            current = (selected or {}).get("current") or {}
+            self._display_refresh_hz = int(current.get("refresh") or 0)
         state.save_config(self.config)
         state.audit("settings.update", actor, d)
         return web.json_response({"ok": True, "config": self.config})
+
+    async def api_display_install(self, request):
+        actor = self._admin(request)
+        if not actor:
+            raise web.HTTPForbidden()
+        if not self._is_local(request):
+            raise web.HTTPForbidden(
+                text="Установку драйвера нужно подтвердить на самом Windows-хосте")
+        ok, error = await asyncio.get_running_loop().run_in_executor(
+            _executor, virtual_display.launch_installer)
+        if not ok:
+            raise web.HTTPBadRequest(text=error)
+        state.audit("display.driver.install", actor)
+        return web.json_response({"ok": True})
 
     async def api_app_role(self, request):
         actor = self._admin(request)
@@ -1979,6 +2190,7 @@ class HostServer:
                     "config": self.config,
                     "capture_ok": CAPTURE_OK, "input_ok": INPUT_OK,
                     "video": self._public_video_capabilities(),
+                    "display": self._display_state(),
                 })
                 try:
                     await asyncio.wait_for(ws.receive(), timeout=2.0)
@@ -2144,8 +2356,10 @@ class HostServer:
         current = None
         try:
             current = self.display.current() if self.display.available else None
+            output = (self.display.selected_output()
+                      if self.display.available and hasattr(self.display, "selected_output") else None)
         except Exception:
-            current = None
+            current, output = None, None
         frame = self.capture.frame
         width = int((current or {}).get("width") or (frame[1] if frame else 1920))
         height = int((current or {}).get("height") or (frame[2] if frame else 1080))
@@ -2153,7 +2367,9 @@ class HostServer:
         try:
             command = video_encoder.command(
                 self.video_encoder, fps, quality, width, height,
-                network.get("safe_stream_mbps", 0))
+                network.get("safe_stream_mbps", 0),
+                output_idx=int((output or {}).get("output_index", 0) or 0),
+                device_idx=int((output or {}).get("device_index", 0) or 0))
         except ValueError as exc:
             return str(exc)
         sess.required_mbps = video_encoder.target_bitrate_mbps(

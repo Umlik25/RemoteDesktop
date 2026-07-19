@@ -165,6 +165,23 @@
         <div class="kv" style="margin-bottom:12px"><b>Сейчас</b><span>Хост</span></div>
         <button class="sec" onclick="switchAppRole('client')">Переключить это устройство в режим клиента</button>
       </div>
+      <div class="card" style="max-width:480px;margin-top:14px">
+        <h2>Экран трансляции</h2>
+        <div class="kv" style="margin-bottom:12px">
+          <b>Сейчас</b><span id="displayOutputStatus">—</span>
+          <b>Виртуальный дисплей</b><span id="virtualDisplayStatus">—</span>
+        </div>
+        <label class="f">Источник изображения<select id="setDisplayOutput">
+          <option value="auto">Авто: предпочитать виртуальный</option>
+          <option value="virtual">Виртуальный экран</option>
+          <option value="physical">Физический экран</option>
+        </select></label>
+        <div class="row">
+          <button id="btnInstallDisplay" onclick="installVirtualDisplay()">Установить виртуальный дисплей</button>
+          <a id="virtualDisplayProject" class="btn sec" target="_blank" rel="noopener">Страница драйвера</a>
+        </div>
+        <p id="virtualDisplayNote" class="muted" style="margin-top:10px"></p>
+      </div>
     </div>
   </div>
 </div>
@@ -219,6 +236,7 @@ function actionButton(text, className, handler, title='') {
 }
 let cfg = {};
 let hostInfo = {};
+let displayInfo = null;
 let adminToken = sessionStorage.getItem('app_remote_admin_token') || '';
 let panelWs = null;
 let confirmationResolver = null;
@@ -338,6 +356,7 @@ function connectWs() {
     const d = JSON.parse(e.data);
     if (d.type !== 'tick') return;
     cfg = d.config;
+    displayInfo = d.display || displayInfo;
     const L = d.load;
     $('#cpuV').textContent = L.cpu_percent + '%'; bar('#cpuB', L.cpu_percent);
     $('#ramV').textContent = L.ram_percent + '% (' + L.ram_used_gb + ' ГБ)'; bar('#ramB', L.ram_percent);
@@ -358,6 +377,7 @@ function connectWs() {
     $('#btnAccept').textContent = cfg.accepting ? '⏸ Остановить новые подключения' : '▶ Разрешить подключения';
     $('#btnWork').textContent = (cfg.work_only_mode ? '✓ ' : '') + 'Режим «только работа»';
     $('#btnGame').textContent = (cfg.owner_gaming_mode ? '✓ ' : '') + 'Игровая сессия владельца';
+    renderDisplaySettings(displayInfo);
     renderSessions(d.sessions);
   };
   ws.onclose = e => {
@@ -564,6 +584,8 @@ function fillSettings() {
   $('#setParentHost').value = cfg.parent_host || '';
   $('#setReserve').value = cfg.owner_reserve_percent;
   $('#setMax').value = cfg.max_sessions;
+  $('#setDisplayOutput').value = cfg.display_output || 'auto';
+  renderDisplaySettings(displayInfo || hostInfo.display);
   updateNodeSettings();
 }
 function updateNodeSettings() {
@@ -573,10 +595,43 @@ function updateNodeSettings() {
   $('#parentHostField').style.display = resolved === 'vm' ? '' : 'none';
 }
 async function saveSettings() {
-  await api('/api/settings', {host_name: $('#setName').value || null,
-    node_type: $('#setNodeType').value, parent_host: $('#setParentHost').value || null,
-    owner_reserve_percent: +$('#setReserve').value, max_sessions: +$('#setMax').value});
-  location.reload();
+  try {
+    await api('/api/settings', {host_name: $('#setName').value || null,
+      node_type: $('#setNodeType').value, parent_host: $('#setParentHost').value || null,
+      display_output: $('#setDisplayOutput').value,
+      owner_reserve_percent: +$('#setReserve').value, max_sessions: +$('#setMax').value});
+    location.reload();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function renderDisplaySettings(display) {
+  if (!display) return;
+  const output = display.output || {};
+  const virtual = display.virtual_display || {};
+  $('#displayOutputStatus').textContent = output.virtual
+    ? `${output.name || output.id} · независимый`
+    : `${output.name || output.id || '—'} · физический`;
+  $('#virtualDisplayStatus').textContent = virtual.ready ? 'готов' : 'не установлен';
+  $('#virtualDisplayStatus').style.color = virtual.ready ? 'var(--ok)' : 'var(--warn)';
+  $('#btnInstallDisplay').style.display = virtual.supported && !virtual.ready ? '' : 'none';
+  $('#virtualDisplayProject').href = virtual.project_url || 'https://github.com/VirtualDrivers/Virtual-Display-Driver';
+  $('#virtualDisplayNote').textContent = virtual.ready
+    ? 'Хост автоматически захватывает виртуальный экран; разрешение физического монитора не меняется.'
+    : 'Установка выполняется один раз на Windows-хосте и потребует подтверждения Windows.';
+}
+
+async function installVirtualDisplay() {
+  if (!await askConfirmation('Установить системный драйвер',
+      'Windows запросит права администратора. После установки перезапустите App_Remote.',
+      'Открыть установку')) return;
+  try {
+    await api('/api/display/install', {});
+    $('#virtualDisplayNote').textContent = 'Подтвердите установку в окне Windows, затем перезапустите App_Remote.';
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
 async function switchAppRole(role) {

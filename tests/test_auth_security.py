@@ -102,6 +102,25 @@ class AuthSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(server._origin_allowed(request, "http://127.0.0.1:8600"))
         self.assertFalse(server._origin_allowed(request, "https://example.com"))
 
+    async def test_virtual_display_install_requires_local_admin_confirmation(self):
+        server = HostServer.__new__(HostServer)
+        auth.create_user("owner", "long-enough-password", role="owner")
+        token = auth.issue_token("owner")
+        remote_request = SimpleNamespace(
+            headers={"Authorization": f"Bearer {token}"}, query={}, remote="192.168.1.50")
+
+        with self.assertRaises(web.HTTPForbidden):
+            await server.api_display_install(remote_request)
+
+        local_request = SimpleNamespace(
+            headers={"Authorization": f"Bearer {token}"}, query={}, remote="127.0.0.1")
+        with mock.patch("core.host_server.virtual_display.launch_installer",
+                        return_value=(True, None)) as launch:
+            response = await server.api_display_install(local_request)
+
+        self.assertEqual(200, response.status)
+        launch.assert_called_once_with()
+
     async def test_admin_http_api_requires_token_and_restricts_origin(self):
         server = HostServer.__new__(HostServer)
         server.config = {"client_port": 8600}

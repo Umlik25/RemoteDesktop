@@ -104,6 +104,11 @@ dialog::backdrop { background:rgba(0,0,0,.7); }
     <option value="85">Q85 · очень высокое</option><option value="95">Q95 · максимум</option>
   </select>
   <select id="selRes" onchange="manualConfigChanged()" title="Разрешение потока"><option value="1">Разрешение…</option></select>
+  <select id="selOutput" onchange="sendConfig()" title="Какой экран Windows передавать" style="display:none">
+    <option value="auto">Экран: авто</option>
+    <option value="virtual">Экран: виртуальный</option>
+    <option value="physical">Экран: физический</option>
+  </select>
   <select id="selDesktop" onchange="sendConfig()" title="Системное разрешение общего рабочего стола Windows" style="display:none">
     <option value="host">Рабочий стол: хост</option>
     <option value="client">Рабочий стол: мой экран</option>
@@ -232,6 +237,7 @@ ensureSelectValue($('#selQ'), P.get('quality') || '70', `Q${P.get('quality')}`);
 $('#selProfile').value = P.get('profile') || 'dev';
 $('#selCodec').value = ['h264','mjpeg'].includes(P.get('codec')) ? P.get('codec') : 'auto';
 $('#selAdaptive').value = P.get('adaptive') === '0' ? 'fixed' : 'auto';
+$('#selOutput').value = ['virtual','physical'].includes(P.get('output')) ? P.get('output') : 'auto';
 $('#selDesktop').value = ['client','viewport'].includes(P.get('desktop')) ? P.get('desktop') : 'host';
 updateDesktopOptions();
 
@@ -644,6 +650,7 @@ function renderOverlay() {
   const deltaShare = total ? Math.round(deltaCnt * 100 / total) : 0;
   const ackLag = sess.ack_latency_ms != null ? Number(sess.ack_latency_ms).toFixed(1) : '—';
   const desktop = (displayState && displayState.current) || {};
+  const streamOutput = (displayState && displayState.output) || {};
   const clientDisplay = clientDisplayInfo();
   const network = s.network || (hello && hello.network) || {};
   ov.innerHTML = `
@@ -656,7 +663,7 @@ function renderOverlay() {
     Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · LAN хоста: <b>${network.link_mbps ? network.link_mbps + ' Мбит/с' : '—'}</b> · Кодек: <b>${esc(s.codec || (mediaMode === 'h264' ? 'H.264 NVENC' : 'MJPEG-дельта'))}</b><br>
     Нужно для движения: <b>${sess.required_mbps ?? '—'} Мбит/с</b> · безопасный предел: <b>${network.safe_stream_mbps ?? '—'} Мбит/с</b> · Захват: <b>${s.capture === 'ddagrab' ? 'Desktop Duplication GPU' : s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
     Поток: <b>${cv.width}×${cv.height}</b> · Экран: <b>${sizeText(clientDisplay.screen)}</b> · Окно: <b>${sizeText(clientDisplay.viewport)}</b><br>
-    Рабочий стол Windows: <b>${desktop.width ? desktop.width + '×' + desktop.height : '—'}</b> · Очередь: <b>${sess.client_queue ?? frameQueue.length}</b><br>
+    Рабочий стол Windows: <b>${desktop.width ? desktop.width + '×' + desktop.height : '—'}</b> · Экран хоста: <b>${streamOutput.virtual ? 'виртуальный · независимый' : 'физический'}</b> · Очередь: <b>${sess.client_queue ?? frameQueue.length}</b><br>
     ${mediaMode === 'h264'
       ? `GPU-видео: <b>аппаратное кодирование и декодирование</b><br>`
       : `Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>`}
@@ -769,8 +776,21 @@ function applyDisplayState(state, authoritative=true) {
     desktopWH = [Number(state.current.width), Number(state.current.height)];
   }
   const sel = $('#selDesktop');
+  const outputSel = $('#selOutput');
   sel.style.display = state.available ? '' : 'none';
+  outputSel.style.display = state.available ? '' : 'none';
   sel.disabled = !state.allowed;
+  outputSel.disabled = !state.allowed;
+  const virtualReady = Boolean(state.virtual_display && state.virtual_display.ready);
+  const virtualOption = outputSel.querySelector('option[value="virtual"]');
+  virtualOption.textContent = virtualReady
+    ? 'Экран: виртуальный' : 'Экран: виртуальный (не установлен)';
+  if (authoritative && state.output) {
+    outputSel.value = state.output.virtual ? 'virtual' : 'physical';
+  }
+  outputSel.title = virtualReady
+    ? 'Виртуальный экран не зависит от подключённого к хосту монитора'
+    : 'Для независимого экрана установите IDD в настройках панели Windows-хоста';
   if (authoritative && (initialConfigSent || !['client','viewport'].includes(P.get('desktop')))) {
     sel.value = ['client','viewport'].includes(state.mode) ? state.mode : 'host';
   }
@@ -778,7 +798,9 @@ function applyDisplayState(state, authoritative=true) {
     ? 'Системное разрешение доступно только на Windows-хосте'
     : !state.allowed
       ? 'Владелец хоста не разрешил менять общий дисплей'
-      : 'Меняет системное разрешение общего рабочего стола Windows; при отключении оно восстановится';
+      : state.independent_from_physical
+        ? 'Меняет разрешение независимого виртуального экрана; физический монитор не затрагивается'
+        : 'Меняет системное разрешение физического экрана; при отключении оно восстановится';
   updateDesktopOptions(state);
   const after = desktopWH && desktopWH.join('x');
   if (resolutionBuilt && before !== after) buildResSelect(false);
@@ -989,13 +1011,15 @@ function sendConfig() {
   const clientDisplay = clientDisplayInfo();
   initialConfigSent = true;
   setStreamStatus(null, true);
-  ws.send(JSON.stringify({type:'config', request_id:requestId, fps, quality, scale,
+  const config = {type:'config', request_id:requestId, fps, quality, scale,
     profile:$('#selProfile').value, adaptive:$('#selAdaptive').value === 'auto',
     video_codec:$('#selCodec').value,
     video_codecs:{h264_mse:H264_MSE},
     desktop_mode:$('#selDesktop').value,
     client_width:clientDisplay.screen.width, client_height:clientDisplay.screen.height,
-    client_display:clientDisplay}));
+    client_display:clientDisplay};
+  if (permissions.display) config.display_output = $('#selOutput').value;
+  ws.send(JSON.stringify(config));
 }
 function manualConfigChanged() {
   $('#selProfile').value = 'custom';
