@@ -480,7 +480,7 @@ async function loadReport() {
         <b>RAM</b><span>${esc(s.ram_gb)} ГБ</span>
         <b>GPU</b><span>${s.gpus.map(g=>esc(g.name) + (g.vram_gb?` (${esc(g.vram_gb)} ГБ VRAM)`:'')).join('<br>')}</span>
         <b>Диски</b><span>${s.disks.map(x=>`${esc(x.mount)} ${esc(x.free_gb)}/${esc(x.total_gb)} ГБ свободно`).join('<br>')}</span>
-        <b>LAN</b><span>${s.nics.map(n=>`${esc(n.name)}: ${esc(n.speed_mbps)} Мбит/с`).join('<br>')||'н/д'}</span>
+        <b>LAN</b><span>${s.nics.map(n=>`${esc(n.name)}: ${esc(n.speed_mbps)} Мбит/с${n.virtual?' (виртуальный)':''}`).join('<br>')||'н/д'}<br><b>Реальный линк: ${esc(d.report.lan_mbps||'н/д')} Мбит/с</b></span>
         <b>ОС</b><span>${esc(s.os)}</span>
         <b>Бенчмарк CPU</b><span>однопоточный ${esc(d.bench.single_score)}, многопоточный ~${esc(d.bench.multi_score_est)} (${esc(d.bench.note)})</span>
       </div></div>

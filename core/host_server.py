@@ -154,6 +154,17 @@ MAX_UPLOAD_MB = 256
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
+def _recent_rate(timestamps, window=1.0):
+    """Число событий в секунду за короткое скользящее окно."""
+    now = time.monotonic()
+    cutoff = now - window
+    try:
+        recent = sum(ts >= cutoff for ts in list(timestamps))
+    except RuntimeError:
+        return 0.0
+    return recent / window
+
+
 # ---------------------------------------------------------------- захват экрана
 
 def _bbox_pad(x0, y0, x1, y1, w, h):
@@ -208,6 +219,8 @@ class ScreenCapture:
         self.backend = None        # "dxgi" | "gdi"
         self.on_frame = None       # колбэк «появился новый кадр» (из потока захвата)
         self.bbox_ring = collections.deque(maxlen=600)   # (seq, bbox|None)
+        self.capture_times = collections.deque(maxlen=600)
+        self.process_ms_ewma = 0.0
         self._thread = None
         self._restart = threading.Event()
         self._seq = 0
@@ -261,6 +274,18 @@ class ScreenCapture:
         if self.on_frame:
             self.on_frame()
 
+    def performance(self):
+        return {
+            "fps": round(_recent_rate(self.capture_times), 1),
+            "process_ms": round(self.process_ms_ewma, 2),
+        }
+
+    def _record_capture(self, process_started):
+        self.capture_times.append(time.monotonic())
+        sample = (time.perf_counter() - process_started) * 1000
+        self.process_ms_ewma = (sample if not self.process_ms_ewma
+                                else self.process_ms_ewma * 0.8 + sample * 0.2)
+
     def _loop(self):
         while self.running:
             self._restart.clear()
@@ -313,8 +338,10 @@ class ScreenCapture:
                     time.sleep(0.05)
                     continue
                 if f is not None:
+                    process_started = time.perf_counter()
                     bbox = _diff_bbox(prev, f) if (prev is not None and NP_OK) else None
                     prev = f
+                    self._record_capture(process_started)
                     if bbox is not False:    # False = кадры идентичны, пропускаем
                         h, w = f.shape[:2]
                         self._publish(f, w, h, bbox)
@@ -343,6 +370,7 @@ class ScreenCapture:
             while self.running and not self._restart.is_set():
                 t0 = time.perf_counter()
                 try:
+                    process_started = time.perf_counter()
                     img = sct.grab(mon)
                     raw = img.bgra
                     if prev is None or raw != prev:   # memcmp: быстрый, с ранним выходом
@@ -354,6 +382,7 @@ class ScreenCapture:
                         prev = raw
                         if bbox is not False:
                             self._publish(raw, img.width, img.height, bbox)
+                    self._record_capture(process_started)
                 except Exception:
                     time.sleep(0.5)
                     continue
@@ -394,7 +423,9 @@ def encode_jpeg(frame, quality, scale, region=None):
             arr = source[y0:y1, x0:x1]
             if scale < 0.999:
                 arr = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
-            bgr = cv2.cvtColor(np.ascontiguousarray(arr), cv2.COLOR_BGRA2BGR)
+            # cvtColor умеет читать ROI со stride. Предварительный
+            # ascontiguousarray копировал каждую дельта-область второй раз.
+            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
             ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
             if ok:
                 return buf.tobytes(), sx, sy, fw, fh
@@ -594,9 +625,10 @@ class Session:
         self.fps = min(base["fps"], user.get("max_fps", 60))
         self.quality = base["quality"]
         self.scale = base["scale"]
-        self.adaptive = True       # сеть может временно снижать параметры потока
+        self.adaptive = True       # сеть/кодировщик могут временно снижать поток
         self.degrade = 0           # 0..4 — ступень деградации по нагрузке хоста
         self.net_degrade = 0       # 0..3 — деградация из-за пропускной способности сети
+        self.pipeline_degrade = 0  # 0..3 — захват/JPEG не укладываются в FPS
         self.force_full = True     # следующий кадр — полный (первый / по запросу клиента)
         self.priority = user.get("priority", "normal")
         self.frames = 0
@@ -615,19 +647,32 @@ class Session:
         self.client_queue = 0
         self.client_decode_ms = 0.0
         self.stale_drops = 0
+        self.frame_bytes_ewma = 0.0
+        self.required_mbps = 0.0
+        self.link_mbps = 0
         self.sent_times = collections.deque(maxlen=240)
+        self.frame_times = collections.deque(maxlen=480)
+        self.encode_ms_ewma = 0.0
+        self.send_ms_ewma = 0.0
 
     def effective(self):
-        """Параметры с учётом деградации (нагрузка хоста + сеть):
+        """Параметры с учётом нагрузки хоста, сети и кодировщика:
         битрейт → FPS → разрешение."""
         q, f, s = self.quality, self.fps, self.scale
-        lvl = min(4, self.degrade + (self.net_degrade if self.adaptive else 0))
-        if lvl >= 1:
+        if self.degrade >= 1:
             q = max(30, q - 20)
-        if lvl >= 2:
+        if self.degrade >= 2:
             f = max(10, f // 2)
-        if lvl >= 3:
+        if self.degrade >= 3:
             s = min(s, 0.5)
+        # При узком LAN сначала уменьшаем кадр, сохраняя плавность.
+        auto_degrade = max(self.net_degrade, self.pipeline_degrade)
+        if self.adaptive and auto_degrade == 1:
+            q, s = max(35, q - 10), min(s, 0.75)
+        elif self.adaptive and auto_degrade == 2:
+            q, f, s = max(30, q - 15), max(15, int(f * 0.75)), min(s, 0.75)
+        elif self.adaptive and auto_degrade >= 3:
+            q, f, s = max(30, q - 20), max(10, f // 2), min(s, 0.5)
         return f, q, s
 
     def info(self, effective=None):
@@ -641,11 +686,18 @@ class Session:
             "requested": {"fps": self.fps, "quality": self.quality,
                           "scale": self.scale, "adaptive": self.adaptive},
             "degrade": self.degrade, "net_degrade": self.net_degrade,
+            "pipeline_degrade": self.pipeline_degrade,
             "bitrate_mbps": round(self.bitrate_mbps, 1),
             "frames": self.frames,
             "ack_latency_ms": round(self.ack_latency_ms, 1),
             "client_queue": self.client_queue,
             "stale_drops": self.stale_drops,
+            "required_mbps": round(self.required_mbps, 1),
+            "link_mbps": self.link_mbps,
+            "actual_fps": round(_recent_rate(self.frame_times), 1),
+            "encode_ms": round(self.encode_ms_ewma, 2),
+            "send_ms": round(self.send_ms_ewma, 2),
+            "decode_ms": round(self.client_decode_ms, 2),
         }
 
 
@@ -893,6 +945,40 @@ class HostServer:
             "display": bool(display_allowed and getattr(self, "display", None)
                             and self.display.available),
         }
+
+    def _network_state(self, sess=None):
+        link = capability.lan_link_mbps(self.static_info or {})
+        # На 100-Мбит Ethernet реальный полезный MJPEG/WebSocket-поток ниже
+        # номинала. Запас не даёт TCP-очереди превратиться в видимую задержку.
+        budget = link * (0.55 if link and link <= 100 else 0.7)
+        if sess is not None:
+            sess.link_mbps = link
+        return {"link_mbps": link, "safe_stream_mbps": round(budget, 1),
+                "limited": bool(link and link <= 100)}
+
+    @staticmethod
+    def _network_pressure_level(required_mbps, budget_mbps):
+        """Ступень, нужная для текущего превышения доступного битрейта."""
+        if not budget_mbps or required_mbps <= budget_mbps * 1.05:
+            return 0
+        ratio = required_mbps / budget_mbps
+        if ratio >= 2.2:
+            return 3
+        if ratio >= 1.45:
+            return 2
+        return 1
+
+    @staticmethod
+    def _pipeline_pressure_level(encode_ms, frame_budget_ms):
+        """Ступень, нужная когда JPEG не укладывается в дедлайн кадра."""
+        if not frame_budget_ms or encode_ms <= frame_budget_ms * 0.72:
+            return 0
+        ratio = encode_ms / frame_budget_ms
+        if ratio >= 1.6:
+            return 3
+        if ratio >= 1.0:
+            return 2
+        return 1
 
     def _frame_notify_threadsafe(self):
         """Из потока захвата: разбудить отправителей кадров в event loop."""
@@ -1158,6 +1244,10 @@ class HostServer:
             why.append(f"Нагрузка хоста временно снизила поток (ступень {sess.degrade})")
         if sess.adaptive and sess.net_degrade > 0:
             why.append(f"Автоадаптация сети временно снизила поток (ступень {sess.net_degrade})")
+        if sess.adaptive and sess.pipeline_degrade > 0:
+            why.append(
+                f"Захват или JPEG не укладываются в целевой FPS "
+                f"(ступень {sess.pipeline_degrade})")
         # Не дублируем одинаковые причины между валидацией и текущим состоянием.
         why = list(dict.fromkeys(why))
         return {
@@ -1208,6 +1298,10 @@ class HostServer:
         sess.fps, sess.quality, sess.scale = fps, quality, scale
         sess.user = user
         sess.net_degrade = 0
+        sess.pipeline_degrade = 0
+        sess.frame_bytes_ewma = 0.0
+        sess.required_mbps = 0.0
+        sess.encode_ms_ewma = 0.0
         new_effective = self._stream_params(sess)
         image_params_changed = (int(old_effective[1]) != int(new_effective[1])
                                 or abs(old_effective[2] - new_effective[2]) > 1e-6)
@@ -1272,6 +1366,8 @@ class HostServer:
             sock = request.transport.get_extra_info("socket")
             if sock is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # AF41 обычно попадает в WMM Video и меньше ждёт в Wi-Fi очереди.
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x88)
         except (AttributeError, OSError):
             pass
 
@@ -1295,6 +1391,7 @@ class HostServer:
             "ram_gb": s.get("ram_gb"),
             "gpus": s.get("gpus"),
             "encoders": s.get("encoders"),
+            "network": self._network_state(),
             "accepting": self.config.get("accepting", True),
             "input_ok": INPUT_OK,
             "sessions": len(self.sessions),
@@ -1701,6 +1798,7 @@ class HostServer:
                             "stream": stream_state,
                             "limits": stream_state["limits"],
                             "display": self._display_state(sess, user),
+                            "network": self._network_state(sess),
                             "transport": {"direct": True, "low_latency": True},
                             "permissions": self._permission_payload(user),
                             "isolation_note": "MVP: все удалённые сессии видят общий рабочий стол хоста. "
@@ -1785,6 +1883,10 @@ class HostServer:
         send_ewma = 0.0
         last_adapt = time.monotonic()
         stale_skips = 0
+        pressure_since = None
+        pipeline_pressure_since = None
+        pipeline_good_since = None
+        last_pipeline_adapt = time.monotonic()
         while not sess.ws.closed:
             ev = self._frame_evt
             fps, quality, scale = self._stream_params(sess)
@@ -1837,6 +1939,48 @@ class HostServer:
                 await asyncio.sleep(0.1)
                 continue
             encode_dt = time.perf_counter() - encode_started
+            encode_ms = encode_dt * 1000
+            sess.encode_ms_ewma = (encode_ms if not sess.encode_ms_ewma
+                                   else sess.encode_ms_ewma * 0.75 + encode_ms * 0.25)
+            now_encoded = time.monotonic()
+            pipeline_level = self._pipeline_pressure_level(
+                sess.encode_ms_ewma, budget * 1000)
+            if sess.adaptive:
+                if pipeline_level:
+                    pipeline_pressure_since = pipeline_pressure_since or now_encoded
+                    pipeline_good_since = None
+                else:
+                    pipeline_pressure_since = None
+                    pipeline_good_since = pipeline_good_since or now_encoded
+                if (pipeline_pressure_since
+                        and now_encoded - pipeline_pressure_since >= 0.5
+                        and now_encoded - last_pipeline_adapt > 1.0
+                        and sess.pipeline_degrade < 3):
+                    sess.pipeline_degrade = max(
+                        sess.pipeline_degrade + 1, min(3, pipeline_level))
+                    sess.encode_ms_ewma = 0.0
+                    sess.force_full = True
+                    pipeline_pressure_since = None
+                    pipeline_good_since = None
+                    last_pipeline_adapt = now_encoded
+                    self._refresh_capture_fps()
+                    self._notify_frame()
+                elif (pipeline_good_since
+                      and now_encoded - pipeline_good_since >= 8.0
+                      and now_encoded - last_pipeline_adapt >= 8.0
+                      and sess.pipeline_degrade > 0):
+                    sess.pipeline_degrade -= 1
+                    sess.encode_ms_ewma = 0.0
+                    sess.force_full = True
+                    pipeline_good_since = None
+                    last_pipeline_adapt = now_encoded
+                    self._refresh_capture_fps()
+                    self._notify_frame()
+            elif sess.pipeline_degrade:
+                sess.pipeline_degrade = 0
+                pipeline_pressure_since = None
+                pipeline_good_since = None
+                self._refresh_capture_fps()
             latest = self.capture.frame
             if (latest is not None and latest[4] != frame[4]
                     and encode_dt > budget * 0.65 and stale_skips < 1):
@@ -1865,9 +2009,22 @@ class HostServer:
             except (ConnectionError, RuntimeError):
                 break
             send_dt = time.perf_counter() - t0
+            send_ms = send_dt * 1000
+            sess.send_ms_ewma = (send_ms if not sess.send_ms_ewma
+                                 else sess.send_ms_ewma * 0.75 + send_ms * 0.25)
             sess.sent_times.append((sess.send_id, sent_at))
             send_ewma = send_dt if not send_ewma else send_ewma * 0.7 + send_dt * 0.3
             now2 = time.monotonic()
+            sess.frame_times.append(now2)
+            sess.frame_bytes_ewma = (len(msg) if not sess.frame_bytes_ewma
+                                     else sess.frame_bytes_ewma * 0.8 + len(msg) * 0.2)
+            sess.required_mbps = sess.frame_bytes_ewma * 8 * fps / 1e6
+            network = self._network_state(sess)
+            budget_mbps = network["safe_stream_mbps"]
+            pressure_level = self._network_pressure_level(
+                sess.required_mbps, budget_mbps)
+            over_link = pressure_level > 0
+            pressure_since = (pressure_since or now2) if over_link else None
             if sess.adaptive:
                 ack_limit = max(80.0, budget * 5 * 1000)
                 lag_bad = (sess.client_queue > 1
@@ -1875,13 +2032,25 @@ class HostServer:
                 lag_good = (sess.client_queue == 0
                             and (not sess.last_ack_id
                                  or sess.ack_latency_ms < max(45.0, budget * 3 * 1000)))
-                if send_dt > max(0.25, budget * 4) and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
+                bandwidth_bad = bool(pressure_since and now2 - pressure_since >= 0.8)
+                bandwidth_good = bool(not budget_mbps
+                                      or sess.required_mbps < budget_mbps * 0.7)
+                if bandwidth_bad and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
+                    # Q95/120 FPS на 100-Мбит порту может превышать безопасный
+                    # бюджет в 3–5 раз. Прыгаем сразу к расчётной ступени, иначе
+                    # пользователь несколько секунд видит TCP-фризы.
+                    sess.net_degrade = max(
+                        sess.net_degrade + 1, min(3, pressure_level))
+                    sess.frame_bytes_ewma = 0.0
+                    pressure_since = None
+                    last_adapt = now2
+                elif send_dt > max(0.25, budget * 4) and sess.net_degrade < 3 and now2 - last_adapt > 1.0:
                     sess.net_degrade += 1  # резкий затык канала — реагируем сразу
                     last_adapt = now2
                 elif (lag_bad or send_ewma > budget * 1.4) and sess.net_degrade < 3 and now2 - last_adapt > 2.0:
                     sess.net_degrade += 1
                     last_adapt = now2
-                elif (lag_good and send_ewma < budget * 0.4
+                elif (lag_good and bandwidth_good and send_ewma < budget * 0.4
                       and sess.net_degrade > 0 and now2 - last_adapt > 8.0):
                     sess.net_degrade -= 1
                     last_adapt = now2
@@ -1914,6 +2083,17 @@ class HostServer:
                 warn.append(f"Канал не успевает за потоком (ступень {sess.net_degrade}): "
                             f"качество временно снижено. Помогут меньший FPS/масштаб "
                             f"или кабельное подключение.")
+            if sess.pipeline_degrade > 0:
+                warn.append(
+                    f"Хост не успевает захватывать или кодировать выбранный поток "
+                    f"(ступень {sess.pipeline_degrade}). Автоадаптация снизила "
+                    f"параметры до устойчивого режима.")
+            network = self._network_state(sess)
+            capture_perf = self.capture.performance()
+            if network["limited"]:
+                warn.append(
+                    f"Ethernet хоста согласован только на {network['link_mbps']} Мбит/с. "
+                    "Проверьте кабель Cat5e/Cat6, гигабитный порт и Auto Negotiation.")
             if sess.client_queue > 1:
                 warn.append(f"Браузер не успевает декодировать поток: в очереди "
                             f"{sess.client_queue} кадр(а)")
@@ -1922,8 +2102,11 @@ class HostServer:
                     "type": "stats", "host": load,
                     "session": sess.info((fps, quality, scale)),
                     "codec": "MJPEG", "capture": self.capture.backend,
+                    "capture_fps": capture_perf["fps"],
+                    "capture_process_ms": capture_perf["process_ms"],
                     "route": sess.route,
                     "fps_target": fps, "quality": quality, "scale": scale,
+                    "network": network,
                     "stream": self._stream_state(sess, user),
                     "display": self._display_state(sess, user),
                     "permissions": self._permission_payload(user),
@@ -2042,6 +2225,7 @@ class HostServer:
                 "cpu": s.get("cpu"), "cores": s.get("cores"), "threads": s.get("threads"),
                 "ram_gb": s.get("ram_gb"),
                 "gpu": (s.get("gpus") or [{}])[0].get("name"),
+                "link_mbps": capability.lan_link_mbps(s),
                 "accepting": self.config.get("accepting", True),
                 "sessions": len(self.sessions),
             }).encode()

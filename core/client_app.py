@@ -65,6 +65,7 @@ async def _discovery_listener(port):
             "gpu": str(d.get("gpu") or "")[:200],
             "cores": d.get("cores"), "threads": d.get("threads"),
             "ram_gb": d.get("ram_gb"), "sessions": d.get("sessions"),
+            "link_mbps": d.get("link_mbps"),
             "accepting": bool(d.get("accepting", True)), "last_seen": time.time(),
         }
         _hosts[f"{addr[0]}:{port}"] = clean

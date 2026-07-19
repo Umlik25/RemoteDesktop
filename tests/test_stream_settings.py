@@ -5,6 +5,7 @@ from unittest import mock
 
 from PIL import Image
 
+from core import capability
 from core.host_server import HostServer, InputInjector, Session, encode_jpeg
 from core.display import DisplayManager, best_mode
 
@@ -41,12 +42,13 @@ class StreamSettingsTests(unittest.TestCase):
         self.assertTrue(session.force_full)
         self.assertEqual(60, server.capture.max_fps)
 
-    def test_fixed_mode_disables_network_adaptation_only(self):
+    def test_fixed_mode_disables_automatic_adaptation_only(self):
         user = {"role": "owner", "profile": "custom", "max_fps": 60,
                 "priority": "critical"}
         _, session = self.make_server(user)
         session.fps, session.quality, session.scale = 120, 80, 1.0
         session.net_degrade = 3
+        session.pipeline_degrade = 3
         session.adaptive = False
 
         self.assertEqual((120, 80, 1.0), session.effective())
@@ -65,6 +67,60 @@ class StreamSettingsTests(unittest.TestCase):
         self.assertEqual(30, response["applied"]["fps"])
         self.assertEqual(60, response["applied"]["quality"])
         self.assertTrue(any("только работа" in reason for reason in response["reasons"]))
+
+    def test_network_degradation_preserves_fps_before_reducing_it(self):
+        _, session = self.make_server({"role": "owner", "profile": "custom",
+                                       "max_fps": 120})
+        session.fps, session.quality, session.scale = 60, 70, 1.0
+
+        session.net_degrade = 1
+        self.assertEqual((60, 60, 0.75), session.effective())
+        session.net_degrade = 2
+        self.assertEqual((45, 55, 0.75), session.effective())
+        session.net_degrade = 3
+        self.assertEqual((30, 50, 0.5), session.effective())
+
+    def test_strongest_automatic_pressure_controls_effective_stream(self):
+        _, session = self.make_server({"role": "owner", "profile": "custom",
+                                       "max_fps": 120})
+        session.fps, session.quality, session.scale = 120, 95, 1.0
+        session.net_degrade = 1
+        session.pipeline_degrade = 3
+
+        self.assertEqual((60, 75, 0.5), session.effective())
+
+    def test_lan_speed_ignores_loopback_and_vpn(self):
+        static = {"nics": [
+            {"name": "Ethernet", "speed_mbps": 100},
+            {"name": "Radmin VPN", "speed_mbps": 100},
+            {"name": "Loopback Pseudo-Interface 1", "speed_mbps": 1073},
+        ]}
+
+        self.assertEqual(100, capability.lan_link_mbps(static))
+
+    def test_network_state_reserves_headroom_on_fast_ethernet(self):
+        server, session = self.make_server({"role": "owner", "max_fps": 60})
+        server.static_info = {"nics": [{"name": "Ethernet", "speed_mbps": 100}]}
+
+        state = server._network_state(session)
+
+        self.assertEqual({"link_mbps": 100, "safe_stream_mbps": 55.0,
+                          "limited": True}, state)
+        self.assertEqual(100, session.link_mbps)
+
+    def test_network_pressure_skips_intermediate_steps_for_impossible_stream(self):
+        level = HostServer._network_pressure_level(260, 55)
+
+        self.assertEqual(3, level)
+        self.assertEqual(2, HostServer._network_pressure_level(90, 55))
+        self.assertEqual(1, HostServer._network_pressure_level(65, 55))
+        self.assertEqual(0, HostServer._network_pressure_level(50, 55))
+
+    def test_pipeline_pressure_uses_frame_deadline(self):
+        self.assertEqual(0, HostServer._pipeline_pressure_level(5.5, 8.33))
+        self.assertEqual(1, HostServer._pipeline_pressure_level(7.0, 8.33))
+        self.assertEqual(2, HostServer._pipeline_pressure_level(9.0, 8.33))
+        self.assertEqual(3, HostServer._pipeline_pressure_level(14.0, 8.33))
 
     def test_encoder_uses_requested_resolution_scale(self):
         width, height = 192, 144
@@ -108,6 +164,7 @@ class StreamSettingsTests(unittest.TestCase):
             {"width": 1280, "height": 720, "refresh": 60, "bpp": 32},
             {"width": 1366, "height": 768, "refresh": 60, "bpp": 32},
         ]
+        mgr.modes = lambda: list(mgr._mode_cache)
         mgr._original = {"width": 1366, "height": 768, "refresh": 60, "bpp": 32}
         requested = {}
 

@@ -25,6 +25,32 @@ STREAM_PROFILES = {
 }
 
 
+_VIRTUAL_NIC_MARKERS = (
+    "loopback", "pseudo", "radmin", "hamachi", "tailscale", "zerotier",
+    "wireguard", "openvpn", "vpn", "tunnel", "tap", "tun", "virtual",
+    "hyper-v", "vmware", "vbox", "bluetooth",
+)
+
+
+def usable_nics(static):
+    """Активные физические LAN-интерфейсы без loopback/VPN-адаптеров."""
+    usable = []
+    for nic in static.get("nics", []):
+        name = str(nic.get("name", "")).lower()
+        speed = nic.get("speed_mbps") or 0
+        if speed <= 0 or nic.get("virtual"):
+            continue
+        if any(marker in name for marker in _VIRTUAL_NIC_MARKERS):
+            continue
+        usable.append(nic)
+    return usable
+
+
+def lan_link_mbps(static):
+    """Скорость лучшего реального LAN-линка, а не виртуального loopback."""
+    return max((nic.get("speed_mbps") or 0 for nic in usable_nics(static)), default=0)
+
+
 def _gpu_class(static):
     """Грубая классификация лучшей GPU: none/basic/mid/high."""
     best = "none"
@@ -47,7 +73,7 @@ def build_report(static, bench, load, config):
     gpu_class = _gpu_class(static)
     ram = static["ram_gb"]
     threads = static["threads"]
-    lan_mbps = max((n["speed_mbps"] for n in static.get("nics", [])), default=0)
+    lan_mbps = lan_link_mbps(static)
 
     levels = {}
 
@@ -95,12 +121,16 @@ def build_report(static, bench, load, config):
           "GPU passthrough (по одной GPU на VM)" if multi_gpu else "недоступен",
           "low" if not ok else "medium")
 
+    warning = ("Это оценка возможностей, а не гарантия производительности. "
+               "Фактическое качество зависит от сети, кодека и одновременной нагрузки.")
+    if 0 < lan_mbps <= 100:
+        warning += (f" Хост подключён только на {lan_mbps} Мбит/с: для плавных "
+                    "60+ FPS проверьте гигабитный порт, кабель Cat5e/Cat6 и Auto Negotiation.")
     return {
         "levels": levels,
         "gpu_class": gpu_class,
         "lan_mbps": lan_mbps,
-        "warning": "Это оценка возможностей, а не гарантия производительности. "
-                   "Фактическое качество зависит от сети, кодека и одновременной нагрузки.",
+        "warning": warning,
     }
 
 
@@ -110,7 +140,7 @@ def capacity_plan(static, bench, load, config):
     reserve = config.get("owner_reserve_percent", 25) / 100
     ram_avail = ram_total * (1 - reserve) - 2  # 2 ГБ на ОС
     cpu_score = bench["multi_score_est"] * (1 - reserve)
-    lan_mbps = max((n["speed_mbps"] for n in static.get("nics", [])), default=100)
+    lan_mbps = lan_link_mbps(static) or 100
     gpu_class = _gpu_class(static)
     enc_slots = {"none": 0, "basic": 1, "mid": 2, "high": 3}[gpu_class] + 2  # MJPEG кодируется CPU — слоты условные
 

@@ -163,6 +163,7 @@ async function loadHosts() {
         <b>CPU</b><span>${esc(h.cpu||'—')} (${esc(h.cores||'?')}я/${esc(h.threads||'?')}п)</span>
         <b>RAM</b><span>${esc(h.ram_gb||'—')} ГБ</span>
         <b>GPU</b><span>${esc(h.gpu||'—')}</span>
+        <b>LAN хоста</b><span class="${h.link_mbps && h.link_mbps <= 100 ? 'badge b-warn' : ''}">${esc(h.link_mbps ? h.link_mbps + ' Мбит/с' : '—')}</span>
         <b>Сессий</b><span>${esc(h.sessions ?? 0)}</span>
         <b>Сценарии</b><span>${esc(scen.join(' / ')||'—')} <span class="muted">${scen.includes('игры*')?'(*зависит от GPU и сети)':''}</span></span>
       </div>
@@ -193,10 +194,12 @@ async function openConnect(ip, port, name) {
   try {
     const info = await (await fetch(`http://${ip}:${port}/api/info`)).json();
     const enc = info.encoders||{};
+    const net = info.network||{};
     $('#dcInfo').innerHTML = `
       <b>ОС</b><span>${esc(info.os||'—')}</span>
       <b>GPU</b><span>${esc((info.gpus||[]).map(g=>g.name).join(', ')||'—')}</span>
       <b>Аппаратные кодеки</b><span>${esc((enc.apis||[]).join(', ')||'нет')} ${enc.av1?'· AV1':''}</span>
+      <b>LAN хоста</b><span class="${net.limited?'badge b-warn':''}">${esc(net.link_mbps ? net.link_mbps + ' Мбит/с' : '—')}</span>
       <b>Кодек потока</b><span>MJPEG (MVP)</span>`;
   } catch(e) { $('#dcInfo').innerHTML = '<b>Статус</b><span style="color:var(--err)">Хост недоступен по HTTP</span>'; }
   dlgConnect.showModal();

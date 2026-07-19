@@ -495,11 +495,14 @@ function renderOverlay() {
   const ackLag = sess.ack_latency_ms != null ? Number(sess.ack_latency_ms).toFixed(1) : '—';
   const desktop = (displayState && displayState.current) || {};
   const clientDisplay = clientDisplayInfo();
+  const network = s.network || (hello && hello.network) || {};
   ov.innerHTML = `
     <span class="badge ${routeCls}">${esc(route)}</span> <b>${esc(hello ? hello.host_name : '')}</b>
     <div class="sec">ПОТОК</div>
-    FPS: <b>${fpsShown}</b> (применено ${applied.fps ?? s.fps_target ?? $('#selFps').value}, выбрано ${selected.fps ?? $('#selFps').value}) · frame time: <b>${frameGapMs.toFixed(1)} мс</b><br>
-    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · Кодек: <b>MJPEG-дельта</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
+    FPS: браузер <b>${fpsShown}</b> · хост <b>${sess.actual_fps ?? '—'}</b> · захват <b>${s.capture_fps ?? '—'}</b> (применено ${applied.fps ?? s.fps_target ?? $('#selFps').value}, выбрано ${selected.fps ?? $('#selFps').value})<br>
+    Frame time: <b>${frameGapMs.toFixed(1)} мс</b> · захват: <b>${s.capture_process_ms ?? '—'} мс</b> · JPEG: <b>${sess.encode_ms ?? '—'} мс</b> · отправка: <b>${sess.send_ms ?? '—'} мс</b><br>
+    Битрейт: <b>${bitrate.toFixed(1)} Мбит/с</b> · LAN хоста: <b>${network.link_mbps ? network.link_mbps + ' Мбит/с' : '—'}</b> · Кодек: <b>MJPEG-дельта</b><br>
+    Нужно для движения: <b>${sess.required_mbps ?? '—'} Мбит/с</b> · безопасный предел: <b>${network.safe_stream_mbps ?? '—'} Мбит/с</b> · Захват: <b>${s.capture === 'dxgi' ? 'DXGI' : s.capture === 'gdi' ? 'GDI' : '—'}</b><br>
     Поток: <b>${cv.width}×${cv.height}</b> · Экран: <b>${sizeText(clientDisplay.screen)}</b> · Окно: <b>${sizeText(clientDisplay.viewport)}</b><br>
     Рабочий стол Windows: <b>${desktop.width ? desktop.width + '×' + desktop.height : '—'}</b> · Очередь: <b>${sess.client_queue ?? frameQueue.length}</b><br>
     Дельта-кадры: <b>${deltaShare}%</b> <span style="color:#8b93a7">(передаются только изменённые области)</span><br>

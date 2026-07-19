@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -22,6 +23,12 @@ _static_cache = None
 _bench_cache = None
 _net_prev = None  # (ts, bytes_sent, bytes_recv) для расчёта скорости
 _gpu_load_cache = (0.0, None)
+
+_VIRTUAL_NIC_MARKERS = (
+    "loopback", "pseudo", "radmin", "hamachi", "tailscale", "zerotier",
+    "wireguard", "openvpn", "vpn", "tunnel", "tap", "tun", "virtual",
+    "hyper-v", "vmware", "vbox", "bluetooth",
+)
 
 
 def _run(cmd, timeout=10):
@@ -209,9 +216,18 @@ def get_static_info():
             continue
 
     nics = []
+    addresses = psutil.net_if_addrs()
     for name, st in psutil.net_if_stats().items():
         if st.isup and st.speed and st.speed > 0:
-            nics.append({"name": name, "speed_mbps": st.speed})
+            ipv4 = [a.address for a in addresses.get(name, [])
+                    if a.family == socket.AF_INET]
+            lowered = name.lower()
+            virtual = any(marker in lowered for marker in _VIRTUAL_NIC_MARKERS)
+            if ipv4 and all(ip.startswith(("127.", "25.", "26.", "169.254."))
+                            for ip in ipv4):
+                virtual = True
+            nics.append({"name": name, "speed_mbps": st.speed,
+                         "addresses": ipv4, "virtual": virtual})
 
     gpus = get_gpus()
     _static_cache = {
