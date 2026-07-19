@@ -2,39 +2,139 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>App_Remote — первый запуск</title>
-<link rel="stylesheet" href="/static/style.css">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App_Remote — настройка</title>
+<link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
-<div class="topbar"><span class="logo">App_Remote</span><span class="muted">Первый запуск — выберите роль этого компьютера</span></div>
-<div class="wrap">
-  <div class="bigchoice">
-    <div class="card" onclick="choose('host')">
-      <div class="ico">🖥️</div>
-      <h1>Этот компьютер будет хостом</h1>
-      <p class="muted">Предоставляет CPU, GPU, RAM и диск другим пользователям.
-      Владелец продолжает работать локально с гарантированным резервом ресурсов.</p>
-      <button>Выбрать роль хоста</button>
-    </div>
-    <div class="card" onclick="choose('client')">
-      <div class="ico">💻</div>
-      <h1>Этот компьютер будет клиентом</h1>
-      <p class="muted">Подключается к хосту и использует выделенные ресурсы:
-      рабочий стол, приложения, при возможности — игры.</p>
-      <button>Выбрать роль клиента</button>
-    </div>
-  </div>
-  <p class="muted" style="text-align:center;margin-top:30px">Роль можно сменить позже: <code>python app.py --reset</code></p>
+<div class="topbar">
+  <span class="logo">App_Remote</span>
+  <span class="muted">Настройка устройства</span>
 </div>
+
+<div class="wrap">
+  <section id="roleStep">
+    <h1 style="text-align:center;margin-top:34px">Как будет использоваться это устройство?</h1>
+    <div class="bigchoice">
+      <div class="card" onclick="showHostSetup()">
+        <div class="ico">▣</div>
+        <h1>Предоставлять доступ</h1>
+        <p class="muted">Опубликовать физический компьютер или отдельную виртуальную машину.</p>
+        <button onclick="event.stopPropagation();showHostSetup()">Настроить хост</button>
+      </div>
+      <div class="card" onclick="chooseClient()">
+        <div class="ico">⌁</div>
+        <h1>Подключаться</h1>
+        <p class="muted">Находить доступные компьютеры и виртуальные машины и управлять ими.</p>
+        <button onclick="event.stopPropagation();chooseClient()">Открыть клиент</button>
+      </div>
+    </div>
+    <p class="muted" style="text-align:center;margin-top:30px">Роль и тип среды можно изменить позже в настройках приложения.</p>
+  </section>
+
+  <section id="hostStep" class="card" style="display:none;max-width:560px;margin:38px auto">
+    <div class="row" style="justify-content:space-between;margin-bottom:12px">
+      <h1 style="margin:0">Публикация среды</h1>
+      <span id="detectedBadge" class="badge b-acc">Определение…</span>
+    </div>
+    <label class="f">Название в списке подключений<input id="hostName" maxlength="64"></label>
+    <label class="f">Что находится внутри этой системы?<select id="nodeType" onchange="updateNodeFields()">
+      <option value="auto">Определить автоматически</option>
+      <option value="physical">Физический компьютер</option>
+      <option value="vm">Виртуальная машина</option>
+    </select></label>
+    <label class="f" id="parentField" style="display:none">Название физического компьютера<input id="parentHost" maxlength="64" placeholder="Например, основной компьютер"></label>
+    <div class="notice" id="nodeHint"></div>
+    <div class="row">
+      <button onclick="chooseHost()">Запустить хост</button>
+      <button class="sec" onclick="backToRoles()">Назад</button>
+    </div>
+    <p id="setupError" class="muted" style="color:var(--err)"></p>
+  </section>
+
+  <section id="doneStep" style="display:none;text-align:center;margin-top:80px">
+    <h1 id="doneTitle">Настройка сохранена</h1>
+    <p class="muted">Локальная панель запускается…</p>
+  </section>
+</div>
+
 <script>
-async function choose(role){
-  await fetch('/api/choose', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({role})});
-  document.body.innerHTML = '<div class="wrap" style="text-align:center;margin-top:80px"><h1>Роль сохранена: ' +
-    (role==='host'?'Хост':'Клиент') + '</h1><p class="muted">Приложение перезапускается… ' +
-    'Панель откроется автоматически через несколько секунд.</p></div>';
-  const port = role==='host' ? 8532 : 8600;
-  setTimeout(()=>{ location.href = 'http://127.0.0.1:'+port; }, 3500);
+let setupInfo = {detected:{kind:'physical'}};
+
+async function loadSetupInfo() {
+  try {
+    setupInfo = await (await fetch('/api/setup-info')).json();
+    document.querySelector('#hostName').value = setupInfo.host_name || setupInfo.hostname || '';
+    document.querySelector('#nodeType').value = setupInfo.node_type || 'auto';
+    document.querySelector('#parentHost').value = setupInfo.parent_host || '';
+    const detectedVm = setupInfo.detected && setupInfo.detected.kind === 'vm';
+    document.querySelector('#detectedBadge').textContent = detectedVm
+      ? `Обнаружена VM${setupInfo.detected.hypervisor ? ' · ' + setupInfo.detected.hypervisor : ''}`
+      : 'Обнаружен физический компьютер';
+    updateNodeFields();
+  } catch (_) {
+    document.querySelector('#detectedBadge').textContent = 'Тип не определён';
+  }
 }
+
+function resolvedNodeType() {
+  const selected = document.querySelector('#nodeType').value;
+  if (selected !== 'auto') return selected;
+  return setupInfo.detected && setupInfo.detected.kind === 'vm' ? 'vm' : 'physical';
+}
+
+function updateNodeFields() {
+  const isVm = resolvedNodeType() === 'vm';
+  document.querySelector('#parentField').style.display = isVm ? '' : 'none';
+  document.querySelector('#nodeHint').textContent = isVm
+    ? 'Клиент будет видеть эту систему как отдельную VM и подключаться прямо к её сетевому адресу.'
+    : 'Клиент будет подключаться прямо к этому компьютеру и использовать доступную ему GPU.';
+}
+
+function showHostSetup() {
+  document.querySelector('#roleStep').style.display = 'none';
+  document.querySelector('#hostStep').style.display = '';
+  updateNodeFields();
+}
+
+function backToRoles() {
+  document.querySelector('#hostStep').style.display = 'none';
+  document.querySelector('#roleStep').style.display = '';
+}
+
+async function chooseHost() {
+  await choose({
+    role:'host',
+    host_name:document.querySelector('#hostName').value.trim(),
+    node_type:document.querySelector('#nodeType').value,
+    parent_host:document.querySelector('#parentHost').value.trim(),
+  });
+}
+
+async function chooseClient() {
+  await choose({role:'client'});
+}
+
+async function choose(payload) {
+  const error = document.querySelector('#setupError');
+  error.textContent = '';
+  try {
+    const response = await fetch('/api/choose', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    if (!response.ok) throw new Error(await response.text());
+    document.querySelector('#roleStep').style.display = 'none';
+    document.querySelector('#hostStep').style.display = 'none';
+    document.querySelector('#doneStep').style.display = '';
+    document.querySelector('#doneTitle').textContent = payload.role === 'host'
+      ? 'Хост настроен' : 'Клиент настроен';
+    const port = payload.role === 'host' ? 8532 : 8600;
+    setTimeout(() => { location.href = `http://127.0.0.1:${port}`; }, 2500);
+  } catch (e) {
+    error.textContent = e.message;
+  }
+}
+
+loadSetupInfo();
 </script>
 </body>
 </html>

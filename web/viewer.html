@@ -137,6 +137,15 @@ dialog::backdrop { background:rgba(0,0,0,.7); }
   <div id="fileState"></div>
 </dialog>
 
+<dialog id="dlgConfirm">
+  <h2 id="confirmTitle">Подтверждение</h2>
+  <p id="confirmText"></p>
+  <div class="row">
+    <button id="confirmOk" onclick="resolveConfirmation(true)">Продолжить</button>
+    <button class="sec" onclick="resolveConfirmation(false)">Отмена</button>
+  </div>
+</dialog>
+
 <script>
 const P = new URLSearchParams(location.search);
 const SECRET = new URLSearchParams(location.hash.slice(1));
@@ -156,6 +165,21 @@ const IS_MAC = /Mac|iPhone|iPad/i.test(navigator.platform || '')
   || /Mac/i.test((navigator.userAgentData && navigator.userAgentData.platform) || '');
 
 let ws, hello = null, lastStats = null, streamState = null, displayState = null;
+let confirmationResolver = null;
+
+function askConfirmation(title, text, action='Продолжить') {
+  $('#confirmTitle').textContent = title;
+  $('#confirmText').textContent = text;
+  $('#confirmOk').textContent = action;
+  $('#dlgConfirm').showModal();
+  return new Promise(resolve => { confirmationResolver = resolve; });
+}
+function resolveConfirmation(accepted) {
+  $('#dlgConfirm').close();
+  const resolve = confirmationResolver;
+  confirmationResolver = null;
+  if (resolve) resolve(accepted);
+}
 let desktopWH = null, initialConfigSent = false, resolutionBuilt = false;
 let configSeq = 0, lastConfigAck = 0;
 let inputEnabled = true, overlayOn = true;
@@ -486,6 +510,8 @@ function renderOverlay() {
   const applied = (streamState && streamState.applied) || {};
   const route = s.route || (hello && hello.route) || '—';
   const routeCls = route === 'LAN Direct' ? 'b-ok' : 'b-acc';
+  const node = (hello && hello.node) || {type:P.get('node') || 'physical'};
+  const nodeName = node.type === 'vm' ? 'VM' : 'Физический хост';
   const warn = (s.warnings || []).map(w => `<div class="w">⚠ ${esc(w)}</div>`).join('');
   const inputWarn = permissions.input ? '' : `<div class="e">${inputReasonText()}</div>`;
   const inputLat = ping ? (ping / 2 + frameGapMs / 2).toFixed(0) : '—';
@@ -497,7 +523,9 @@ function renderOverlay() {
   const clientDisplay = clientDisplayInfo();
   const network = s.network || (hello && hello.network) || {};
   ov.innerHTML = `
-    <span class="badge ${routeCls}">${esc(route)}</span> <b>${esc(hello ? hello.host_name : '')}</b>
+    <span class="badge ${routeCls}">${esc(route)}</span>
+    <span class="badge ${node.type === 'vm' ? 'b-acc' : 'b-ok'}">${nodeName}</span>
+    <b>${esc(hello ? hello.host_name : '')}</b>
     <div class="sec">ПОТОК</div>
     FPS: браузер <b>${fpsShown}</b> · хост <b>${sess.actual_fps ?? '—'}</b> · захват <b>${s.capture_fps ?? '—'}</b> (применено ${applied.fps ?? s.fps_target ?? $('#selFps').value}, выбрано ${selected.fps ?? $('#selFps').value})<br>
     Frame time: <b>${frameGapMs.toFixed(1)} мс</b> · захват: <b>${s.capture_process_ms ?? '—'} мс</b> · JPEG: <b>${sess.encode_ms ?? '—'} мс</b> · отправка: <b>${sess.send_ms ?? '—'} мс</b><br>
@@ -1136,7 +1164,7 @@ async function downloadFile(name) {
   }
 }
 async function deleteFile(name) {
-  if (!confirm(`Удалить «${name}»?`)) return;
+  if (!await askConfirmation('Удалить файл', `Файл «${name}» будет удалён.`, 'Удалить')) return;
   const state = $('#fileState');
   try {
     await fileApi('/api/files/delete', {method:'POST', headers:{'Content-Type':'application/json'},

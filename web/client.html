@@ -2,8 +2,9 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>App_Remote — панель клиента</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
 <div class="topbar">
@@ -11,19 +12,23 @@
   <span class="muted">Панель клиента — доступные хосты</span>
   <span style="flex:1"></span>
   <span class="badge b-ok">Обнаружение: UDP broadcast (LAN)</span>
+  <button class="sec small" onclick="$('#dlgClientSettings').showModal()">Настройки</button>
 </div>
 
 <div class="wrap">
-  <div class="notice">Хосты в вашей локальной сети находятся автоматически — соединение идёт напрямую по LAN,
-  без интернета и relay-серверов. Хост в другой сети можно добавить вручную по IP (порт-форвардинг/VPN — на вашей стороне;
-  встроенный P2P/NAT traversal — этап 2).</div>
+  <div class="notice">Физические хосты и виртуальные машины в вашей локальной сети находятся автоматически.
+  Соединение всегда идёт напрямую к выбранной среде по LAN, без проксирования видео через другой компьютер.</div>
 
   <div class="row" style="margin-bottom:14px">
-    <input id="manIp" placeholder="IP хоста (для другой сети)" style="width:200px">
-    <input id="manPort" placeholder="Порт" value="8532" style="width:90px">
-    <button class="sec" onclick="addManual()">Добавить вручную</button>
+    <button onclick="openEnvironmentDialog()">Добавить среду</button>
     <span style="flex:1"></span>
     <button class="sec" onclick="loadHosts()">⟳ Обновить</button>
+  </div>
+
+  <div class="tabs" id="nodeFilters" aria-label="Тип среды">
+    <button class="active" data-node-filter="all" onclick="setNodeFilter('all')">Все среды</button>
+    <button data-node-filter="physical" onclick="setNodeFilter('physical')">Физические хосты</button>
+    <button data-node-filter="vm" onclick="setNodeFilter('vm')">Виртуальные машины</button>
   </div>
 
   <div id="hostList" class="grid g2"></div>
@@ -31,6 +36,45 @@
     Поиск хостов в локальной сети…<br>Убедитесь, что на хосте запущено приложение в роли «Хост»
     и брандмауэр разрешает python.exe.</p>
 </div>
+
+<dialog id="dlgEnvironment">
+  <h2 id="envTitle">Добавить среду</h2>
+  <label class="f">Название<input id="envName" maxlength="64" placeholder="Например, игровая VM"></label>
+  <div class="row">
+    <label class="f" style="flex:1">IP-адрес<input id="envIp" placeholder="192.168.0.170"></label>
+    <label class="f" style="width:110px">Порт<input id="envPort" type="number" min="1" max="65535" value="8532"></label>
+  </div>
+  <label class="f">Тип среды<select id="envType" onchange="updateEnvironmentFields()">
+    <option value="physical">Физический хост</option>
+    <option value="vm">Виртуальная машина</option>
+  </select></label>
+  <label class="f" id="envParentField" style="display:none">Физический хост этой VM<input id="envParent" maxlength="64"></label>
+  <div class="row">
+    <button onclick="saveEnvironment()">Сохранить</button>
+    <button class="sec" onclick="$('#dlgEnvironment').close()">Отмена</button>
+  </div>
+  <p id="envError" class="muted" style="color:var(--err)"></p>
+</dialog>
+
+<dialog id="dlgClientSettings">
+  <h2>Настройки приложения</h2>
+  <div class="kv" style="margin-bottom:16px">
+    <b>Текущая роль</b><span>Клиент</span>
+    <b>Локальная панель</b><span>127.0.0.1:8600</span>
+  </div>
+  <button onclick="switchAppRole('host')">Использовать это устройство как хост</button>
+  <button class="sec" onclick="$('#dlgClientSettings').close()">Закрыть</button>
+  <p id="roleError" class="muted" style="color:var(--err)"></p>
+</dialog>
+
+<dialog id="dlgConfirm">
+  <h2 id="confirmTitle">Подтверждение</h2>
+  <p id="confirmText"></p>
+  <div class="row">
+    <button id="confirmOk" onclick="resolveConfirmation(true)">Продолжить</button>
+    <button class="sec" onclick="resolveConfirmation(false)">Отмена</button>
+  </div>
+</dialog>
 
 <!-- Диалог подключения -->
 <dialog id="dlgConnect">
@@ -93,7 +137,36 @@ const $ = s => document.querySelector(s);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 })[ch]);
-let hosts = [], current = null, mode = 'login';
+let hosts = [], current = null, mode = 'login', nodeFilter = 'all';
+let editingEnvironment = null, switchingRole = false;
+let confirmationResolver = null;
+
+function askConfirmation(title, text, action='Продолжить') {
+  $('#confirmTitle').textContent = title;
+  $('#confirmText').textContent = text;
+  $('#confirmOk').textContent = action;
+  $('#dlgConfirm').showModal();
+  return new Promise(resolve => { confirmationResolver = resolve; });
+}
+
+function resolveConfirmation(accepted) {
+  $('#dlgConfirm').close();
+  const resolve = confirmationResolver;
+  confirmationResolver = null;
+  if (resolve) resolve(accepted);
+}
+
+function nodeLabel(type) {
+  return type === 'vm' ? 'Виртуальная машина' : 'Физический хост';
+}
+
+function setNodeFilter(filter) {
+  nodeFilter = ['physical', 'vm'].includes(filter) ? filter : 'all';
+  document.querySelectorAll('#nodeFilters button').forEach(button => {
+    button.classList.toggle('active', button.dataset.nodeFilter === nodeFilter);
+  });
+  renderHosts();
+}
 
 function pixelSize(width, height, dpr) {
   return {width:Math.max(1, Math.round((Number(width) || 1) * dpr)),
@@ -143,12 +216,28 @@ async function doReset() {
 }
 
 async function loadHosts() {
-  hosts = await (await fetch('/api/hosts')).json();
+  try {
+    hosts = await (await fetch('/api/hosts')).json();
+    renderHosts();
+  } catch (error) {
+    if (!switchingRole) $('#noHosts').textContent = 'Локальная панель временно недоступна.';
+  }
+}
+
+function renderHosts() {
+  const visibleHosts = hosts.filter(h => nodeFilter === 'all' || h.node_type === nodeFilter);
   const box = $('#hostList'); box.innerHTML = '';
-  $('#noHosts').style.display = hosts.length ? 'none' : '';
-  for (const h of hosts) {
+  $('#noHosts').style.display = visibleHosts.length ? 'none' : '';
+  $('#noHosts').innerHTML = hosts.length
+    ? 'В выбранной категории пока нет доступных сред.'
+    : 'Поиск физических хостов и VM в локальной сети…<br>Запустите приложение в роли «Хост» внутри нужной системы.';
+  for (const h of visibleHosts) {
     const div = document.createElement('div');
     div.className = 'card';
+    const isVm = h.node_type === 'vm';
+    const nodeMeta = isVm && h.parent_host
+      ? `на хосте ${esc(h.parent_host)}`
+      : (isVm && h.hypervisor ? esc(h.hypervisor) : 'прямое подключение');
     const scen = [];
     if ((h.ram_gb||0) >= 8) scen.push('работа');
     if ((h.threads||0) >= 8) scen.push('разработка');
@@ -156,9 +245,10 @@ async function loadHosts() {
     div.innerHTML = `
       <div class="row" style="justify-content:space-between">
         <h2 style="margin:0">${esc(h.name)}</h2>
-        <span class="badge ${h.accepting?'b-ok':'b-err'}">${h.accepting?'доступен':'закрыт'}</span>
+        <span class="badge ${isVm?'b-acc':'b-ok'}">${nodeLabel(h.node_type)}</span>
       </div>
       <div class="kv" style="margin:8px 0">
+        <b>Среда</b><span>${nodeMeta} · <span class="${h.accepting?'':'badge b-err'}">${h.accepting?'доступна':'закрыта'}</span></span>
         <b>Адрес</b><span>${esc(h.ip)}:${esc(h.port)} ${h.manual?'(вручную)':'<span class="badge b-ok">LAN Direct</span>'}</span>
         <b>CPU</b><span>${esc(h.cpu||'—')} (${esc(h.cores||'?')}я/${esc(h.threads||'?')}п)</span>
         <b>RAM</b><span>${esc(h.ram_gb||'—')} ГБ</span>
@@ -167,35 +257,112 @@ async function loadHosts() {
         <b>Сессий</b><span>${esc(h.sessions ?? 0)}</span>
         <b>Сценарии</b><span>${esc(scen.join(' / ')||'—')} <span class="muted">${scen.includes('игры*')?'(*зависит от GPU и сети)':''}</span></span>
       </div>
-      <div class="connect-slot"></div>`;
+      <div class="connect-slot row"></div>`;
+    const actions = div.querySelector('.connect-slot');
     const button = document.createElement('button');
-    button.textContent = 'Подключиться';
+    button.textContent = isVm ? 'Открыть виртуальную машину' : 'Подключиться к хосту';
     button.disabled = !h.accepting;
-    button.addEventListener('click', () => openConnect(h.ip, h.port, h.name || h.ip));
-    div.querySelector('.connect-slot').appendChild(button);
+    button.addEventListener('click', () => openConnect(h));
+    actions.appendChild(button);
+    if (h.manual) {
+      const edit = document.createElement('button');
+      edit.className = 'sec';
+      edit.textContent = 'Изменить';
+      edit.addEventListener('click', () => openEnvironmentDialog(h));
+      actions.appendChild(edit);
+      const remove = document.createElement('button');
+      remove.className = 'sec';
+      remove.textContent = 'Удалить';
+      remove.addEventListener('click', () => removeEnvironment(h));
+      actions.appendChild(remove);
+    }
     box.appendChild(div);
   }
 }
 
-async function addManual() {
-  const ip = $('#manIp').value.trim();
-  if (!ip) return;
-  await fetch('/api/hosts/add', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ip, port:+$('#manPort').value||8532})});
-  loadHosts();
+function openEnvironmentDialog(host=null) {
+  editingEnvironment = host ? {ip:host.ip, port:host.port} : null;
+  $('#envTitle').textContent = host ? 'Изменить среду' : 'Добавить среду';
+  $('#envName').value = host ? host.name || '' : '';
+  $('#envIp').value = host ? host.ip : '';
+  $('#envPort').value = host ? host.port : 8532;
+  $('#envType').value = host ? host.node_type || 'physical' : 'physical';
+  $('#envParent').value = host ? host.parent_host || '' : '';
+  $('#envError').textContent = '';
+  updateEnvironmentFields();
+  $('#dlgEnvironment').showModal();
 }
 
-async function openConnect(ip, port, name) {
-  current = {ip, port, name};
+function updateEnvironmentFields() {
+  $('#envParentField').style.display = $('#envType').value === 'vm' ? '' : 'none';
+}
+
+async function saveEnvironment() {
+  const payload = {
+    name:$('#envName').value.trim(), ip:$('#envIp').value.trim(),
+    port:+$('#envPort').value || 8532, node_type:$('#envType').value,
+    parent_host:$('#envParent').value.trim(),
+  };
+  let path = '/api/hosts/add';
+  if (editingEnvironment) {
+    path = '/api/hosts/update';
+    payload.original_ip = editingEnvironment.ip;
+    payload.original_port = editingEnvironment.port;
+  }
+  try {
+    const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    if (!response.ok) throw new Error(await response.text());
+    $('#dlgEnvironment').close();
+    await loadHosts();
+  } catch (error) {
+    $('#envError').textContent = error.message;
+  }
+}
+
+async function removeEnvironment(host) {
+  if (!await askConfirmation('Удалить среду',
+      `Сохранённая среда «${host.name}» будет удалена из списка.`, 'Удалить')) return;
+  const response = await fetch('/api/hosts/remove', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:host.ip, port:host.port})});
+  if (response.ok) await loadHosts();
+}
+
+async function switchAppRole(role) {
+  if (!await askConfirmation('Переключить роль',
+      'Приложение перезапустит локальную панель в режиме хоста. Текущие окна подключения останутся открыты.',
+      'Переключить')) return;
+  try {
+    const response = await fetch('/api/app/role', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({role})});
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    switchingRole = true;
+    $('#dlgClientSettings').close();
+    document.body.innerHTML = '<div class="wrap" style="text-align:center;margin-top:80px"><h1>Запускаю панель хоста</h1><p class="muted">Подождите несколько секунд…</p></div>';
+    setTimeout(() => { location.href = `http://127.0.0.1:${result.port}`; }, 2200);
+  } catch (error) {
+    $('#roleError').textContent = error.message;
+  }
+}
+
+async function openConnect(host) {
+  current = {...host};
+  const {ip, port} = current;
+  const name = current.name || ip;
   updateClientDisplayOptions();
-  $('#dcTitle').textContent = 'Подключение к «' + name + '»';
+  $('#dcTitle').textContent = `${nodeLabel(current.node_type)} «${name}»`;
   $('#cErr').textContent = '';
   // Пробуем получить свежие сведения напрямую с хоста
   try {
     const info = await (await fetch(`http://${ip}:${port}/api/info`)).json();
     const enc = info.encoders||{};
     const net = info.network||{};
+    const node = info.node || {type:current.node_type || 'physical'};
+    current.node_type = node.type;
+    current.name = info.name || name;
     $('#dcInfo').innerHTML = `
+      <b>Среда</b><span>${esc(nodeLabel(node.type))}${node.hypervisor?' · '+esc(node.hypervisor):''}${node.parent_host?' · хост '+esc(node.parent_host):''}</span>
       <b>ОС</b><span>${esc(info.os||'—')}</span>
       <b>GPU</b><span>${esc((info.gpus||[]).map(g=>g.name).join(', ')||'—')}</span>
       <b>Аппаратные кодеки</b><span>${esc((enc.apis||[]).join(', ')||'нет')} ${enc.av1?'· AV1':''}</span>
@@ -231,7 +398,7 @@ async function doConnect() {
     const q = new URLSearchParams({host: ip, port,
       fps: $('#cFps').value, quality: $('#cQ').value, scale: $('#cScale').value,
       profile: $('#cProfile').value, adaptive: '1', desktop: $('#cDesktop').value,
-      name: current.name});
+      name: current.name, node: current.node_type || 'physical'});
     window.open('/viewer?' + q + '#token=' + encodeURIComponent(d.token), '_blank');
     dlgConnect.close();
   } catch(e) { $('#cErr').textContent = e.message; }

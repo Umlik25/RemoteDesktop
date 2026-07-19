@@ -785,6 +785,7 @@ class HostServer:
         r.add_get("/api/sessions", self.api_sessions)
         r.add_post("/api/sessions/kick", self.api_kick)
         r.add_post("/api/settings", self.api_settings)
+        r.add_post("/api/app/role", self.api_app_role)
         r.add_get("/api/audit", self.api_audit)
         r.add_get("/api/history", self.api_history)
         r.add_get("/ws/panel", self.ws_panel)
@@ -1427,6 +1428,22 @@ class HostServer:
     def host_name(self):
         return self.config.get("host_name") or self.static_info.get("hostname", "Host")
 
+    def node_identity(self):
+        environment = (self.static_info or {}).get("environment") or {}
+        detected = environment.get("kind") if environment.get("kind") in ("physical", "vm") else "physical"
+        configured = self.config.get("node_type", "auto")
+        if configured not in ("auto", "physical", "vm"):
+            configured = "auto"
+        resolved = detected if configured == "auto" else configured
+        return {
+            "type": resolved,
+            "configured": configured,
+            "detected": detected,
+            "hypervisor": environment.get("hypervisor") if resolved == "vm" else None,
+            "parent_host": (self.config.get("parent_host") or None)
+                           if resolved == "vm" else None,
+        }
+
     # ------------------------------------------------------------ страницы
 
     async def page_panel(self, request):
@@ -1439,6 +1456,7 @@ class HostServer:
         return web.json_response({
             "app": "App_Remote", "version": "0.1.0", "role": "host",
             "name": self.host_name(),
+            "node": self.node_identity(),
             "os": s.get("os"), "cpu": s.get("cpu"),
             "cores": s.get("cores"), "threads": s.get("threads"),
             "ram_gb": s.get("ram_gb"),
@@ -1771,9 +1789,41 @@ class HostServer:
             if len(name) > 64 or any(ord(ch) < 32 for ch in name):
                 raise web.HTTPBadRequest(text="Имя хоста должно быть короче 65 символов")
             self.config["host_name"] = name or None
+        if "node_type" in d:
+            node_type = str(d["node_type"] or "auto")
+            if node_type not in ("auto", "physical", "vm"):
+                raise web.HTTPBadRequest(text="Неизвестный тип узла")
+            self.config["node_type"] = node_type
+        if "parent_host" in d:
+            parent = str(d["parent_host"] or "").strip()
+            if len(parent) > 64 or any(ord(ch) < 32 for ch in parent):
+                raise web.HTTPBadRequest(text="Имя физического хоста должно быть короче 65 символов")
+            self.config["parent_host"] = parent or None
         state.save_config(self.config)
         state.audit("settings.update", actor, d)
         return web.json_response({"ok": True, "config": self.config})
+
+    async def api_app_role(self, request):
+        actor = self._admin(request)
+        if not actor:
+            raise web.HTTPForbidden()
+        if not self._is_local(request):
+            raise web.HTTPForbidden(text="Роль можно менять только с самого компьютера")
+        d = await request.json()
+        role = d.get("role")
+        if role not in ("host", "client"):
+            raise web.HTTPBadRequest(text="Неизвестная роль")
+        self.config["role"] = role
+        state.save_config(self.config)
+        state.audit("app.role", actor, {"role": role})
+
+        def stop_app():
+            raise web.GracefulExit()
+
+        asyncio.get_running_loop().call_later(0.4, stop_app)
+        return web.json_response({"ok": True, "role": role,
+                                  "port": (self.config["host_port"] if role == "host"
+                                           else self.config["client_port"])})
 
     async def api_audit(self, request):
         if not self._admin(request):
@@ -1843,6 +1893,7 @@ class HostServer:
         stream_state = self._stream_state(sess, user)
         await ws.send_json({"type": "hello", "sid": sess.sid,
                             "host_name": self.host_name(),
+                            "node": self.node_identity(),
                             "route": sess.route,
                             "codec": "MJPEG (MVP; H.264/HEVC в дорожной карте)",
                             "screen": scr,
@@ -1854,8 +1905,12 @@ class HostServer:
                             "network": self._network_state(sess),
                             "transport": {"direct": True, "low_latency": True},
                             "permissions": self._permission_payload(user),
-                            "isolation_note": "MVP: все удалённые сессии видят общий рабочий стол хоста. "
-                                              "Изоляция через VM — этап 2."})
+                            "isolation_note": (
+                                "Подключение идёт к отдельной виртуальной машине. "
+                                "Сессии этого узла видят рабочий стол этой VM."
+                                if self.node_identity()["type"] == "vm" else
+                                "Все удалённые сессии этого узла видят общий рабочий стол физического хоста."
+                            )})
         self._refresh_capture_fps()
         sender = asyncio.create_task(self._frame_sender(sess))
         stats = asyncio.create_task(self._stats_sender(sess))
@@ -2276,9 +2331,14 @@ class HostServer:
         first_pass = True
         while True:
             s = self.static_info or {}
+            node = self.node_identity()
             payload = json.dumps({
                 "app": "App_Remote", "v": 1, "role": "host",
                 "name": self.host_name(),
+                "node_type": node["type"],
+                "node_detected": node["detected"],
+                "hypervisor": node["hypervisor"],
+                "parent_host": node["parent_host"],
                 "port": self.config["host_port"],
                 "cpu": s.get("cpu"), "cores": s.get("cores"), "threads": s.get("threads"),
                 "ram_gb": s.get("ram_gb"),

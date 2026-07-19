@@ -11,12 +11,15 @@ WEB_DIR = os.path.join(APP_DIR, "web")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 AUDIT_PATH = os.path.join(DATA_DIR, "audit.log")
 SESSIONS_LOG_PATH = os.path.join(DATA_DIR, "sessions.log")
+CLIENT_HOSTS_PATH = os.path.join(DATA_DIR, "client_hosts.json")
 
 _lock = threading.Lock()
 
 DEFAULT_CONFIG = {
     "role": None,                 # "host" | "client"
     "host_name": None,            # отображаемое имя хоста
+    "node_type": "auto",         # "auto" | "physical" | "vm"
+    "parent_host": None,          # имя физического хоста для VM (необязательно)
     "host_port": 8532,            # HTTP/WS порт хоста
     "discovery_port": 8533,       # UDP порт LAN-обнаружения
     "client_port": 8600,          # локальная панель клиента
@@ -61,6 +64,38 @@ def save_config(cfg):
             except OSError:
                 pass
             os.replace(tmp_path, CONFIG_PATH)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
+def load_client_hosts():
+    ensure_data_dir()
+    try:
+        with open(CLIENT_HOSTS_PATH, "r", encoding="utf-8") as f:
+            hosts = json.load(f)
+        return hosts if isinstance(hosts, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_client_hosts(hosts):
+    """Persist manually added client destinations with an atomic replace."""
+    ensure_data_dir()
+    with _lock:
+        fd, tmp_path = tempfile.mkstemp(prefix=".client_hosts_", suffix=".tmp", dir=DATA_DIR)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(hosts, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, CLIENT_HOSTS_PATH)
         finally:
             try:
                 os.unlink(tmp_path)

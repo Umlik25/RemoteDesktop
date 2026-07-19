@@ -3,13 +3,14 @@
 <head>
 <meta charset="utf-8">
 <title>App_Remote — панель хоста</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
 <div class="topbar">
   <span class="logo">App_Remote</span>
   <span class="muted">Панель хоста / владельца</span>
   <span id="hostname" class="badge b-acc"></span>
+  <span id="nodeBadge" class="badge b-ok"></span>
   <span style="flex:1"></span>
   <span id="adminBadge" class="badge b-acc" style="display:none"></span>
   <button id="btnLogout" class="sec small" style="display:none" onclick="logout()">Выйти</button>
@@ -48,9 +49,7 @@
     <!-- ======================= ОБЗОР ======================= -->
     <div id="tab-overview" class="tab">
       <div id="mvpNotice" class="notice">
-        MVP-режим: удалённые сессии видят общий рабочий стол хоста (демо-стриминг).
-        Полная изоляция сессий через VM и аппаратные кодеки H.264/HEVC/AV1 — этап 2 (см. ARCHITECTURE.md).
-        Трафик без TLS — используйте в доверенной локальной сети.
+        Удалённые сессии этого узла видят один общий рабочий стол. Трафик без TLS — используйте в доверенной локальной сети.
       </div>
       <div class="grid g2">
         <div class="card">
@@ -150,11 +149,21 @@
       <div class="card" style="max-width:480px">
         <h2>Настройки хоста</h2>
         <label class="f">Имя хоста (видно клиентам)<input id="setName"></label>
+        <label class="f">Тип среды<select id="setNodeType" onchange="updateNodeSettings()">
+          <option value="auto">Определять автоматически</option>
+          <option value="physical">Физический хост</option>
+          <option value="vm">Виртуальная машина</option>
+        </select></label>
+        <label class="f" id="parentHostField">Физический хост этой VM (необязательно)<input id="setParentHost" placeholder="Например, DESKTOP-U6I6LI8"></label>
         <label class="f">Резерв ресурсов владельца, %<input id="setReserve" type="number" min="0" max="80"></label>
         <label class="f">Максимум одновременных сессий<input id="setMax" type="number" min="1" max="16"></label>
         <button onclick="saveSettings()">Сохранить</button>
         <p class="muted" style="margin-top:10px">Порт хоста: 8532 (HTTP/WS), обнаружение: UDP 8533.
         При первом запуске разрешите доступ в брандмауэре Windows для python.exe.</p>
+        <hr style="border-color:var(--line);margin:18px 0">
+        <h2>Роль приложения</h2>
+        <div class="kv" style="margin-bottom:12px"><b>Сейчас</b><span>Хост</span></div>
+        <button class="sec" onclick="switchAppRole('client')">Переключить это устройство в режим клиента</button>
       </div>
     </div>
   </div>
@@ -186,6 +195,15 @@
   <p id="nuErr" class="muted" style="color:var(--err)"></p>
 </dialog>
 
+<dialog id="dlgConfirm">
+  <h2 id="confirmTitle">Подтверждение</h2>
+  <p id="confirmText"></p>
+  <div class="row">
+    <button id="confirmOk" onclick="resolveConfirmation(true)">Продолжить</button>
+    <button class="sec" onclick="resolveConfirmation(false)">Отмена</button>
+  </div>
+</dialog>
+
 <script>
 const $ = s => document.querySelector(s);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -200,8 +218,24 @@ function actionButton(text, className, handler, title='') {
   return button;
 }
 let cfg = {};
+let hostInfo = {};
 let adminToken = sessionStorage.getItem('app_remote_admin_token') || '';
 let panelWs = null;
+let confirmationResolver = null;
+
+function askConfirmation(title, text, action='Продолжить') {
+  $('#confirmTitle').textContent = title;
+  $('#confirmText').textContent = text;
+  $('#confirmOk').textContent = action;
+  $('#dlgConfirm').showModal();
+  return new Promise(resolve => { confirmationResolver = resolve; });
+}
+function resolveConfirmation(accepted) {
+  $('#dlgConfirm').close();
+  const resolve = confirmationResolver;
+  confirmationResolver = null;
+  if (resolve) resolve(accepted);
+}
 
 document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('.tabs button').forEach(x => x.classList.remove('active'));
@@ -227,7 +261,14 @@ async function api(path, body) {
 
 async function init() {
   const info = await api('/api/info');
+  hostInfo = info;
   $('#hostname').textContent = info.name;
+  const node = info.node || {type:'physical', detected:'physical'};
+  $('#nodeBadge').textContent = node.type === 'vm' ? 'Виртуальная машина' : 'Физический хост';
+  $('#nodeBadge').className = 'badge ' + (node.type === 'vm' ? 'b-acc' : 'b-ok');
+  $('#mvpNotice').textContent = node.type === 'vm'
+    ? 'Этот агент публикует отдельную виртуальную машину. Клиенты подключаются прямо к VM и видят только её рабочий стол; несколько подключений к этой VM используют один её рабочий стол. Используйте только в доверенной LAN.'
+    : 'Этот агент публикует физический хост напрямую. Клиенты используют его GPU и общий рабочий стол; виртуальные машины отображаются в клиенте отдельными средами. Используйте только в доверенной LAN.';
   if (info.needs_owner_setup) { $('#ownerSetup').style.display = ''; return; }
   if (adminToken) {
     try {
@@ -414,7 +455,13 @@ async function setUserQuota(username, current) {
   catch(e) { alert('Ошибка: ' + e.message); }
 }
 async function blockUser(username, blocked) { await api('/api/users/update', {username, fields:{blocked}}); loadUsers(); }
-async function delUser(username) { if (confirm('Удалить пользователя и отозвать доступ?')) { await api('/api/users/delete', {username}); loadUsers(); } }
+async function delUser(username) {
+  if (await askConfirmation('Удалить пользователя',
+      `Учётная запись «${username}» и её доступ будут удалены.`, 'Удалить')) {
+    await api('/api/users/delete', {username});
+    loadUsers();
+  }
+}
 
 async function loadInvites() {
   const inv = await api('/api/invites');
@@ -511,13 +558,36 @@ async function loadLogs() {
 
 function fillSettings() {
   $('#setName').value = cfg.host_name || '';
+  $('#setNodeType').value = cfg.node_type || 'auto';
+  $('#setParentHost').value = cfg.parent_host || '';
   $('#setReserve').value = cfg.owner_reserve_percent;
   $('#setMax').value = cfg.max_sessions;
+  updateNodeSettings();
+}
+function updateNodeSettings() {
+  const configured = $('#setNodeType').value;
+  const detected = (hostInfo.node && hostInfo.node.detected) || 'physical';
+  const resolved = configured === 'auto' ? detected : configured;
+  $('#parentHostField').style.display = resolved === 'vm' ? '' : 'none';
 }
 async function saveSettings() {
   await api('/api/settings', {host_name: $('#setName').value || null,
+    node_type: $('#setNodeType').value, parent_host: $('#setParentHost').value || null,
     owner_reserve_percent: +$('#setReserve').value, max_sessions: +$('#setMax').value});
-  alert('Сохранено');
+  location.reload();
+}
+
+async function switchAppRole(role) {
+  if (!await askConfirmation('Переключить роль',
+      'Активные подключения к этому хосту будут завершены, затем откроется панель клиента.',
+      'Переключить')) return;
+  try {
+    const result = await api('/api/app/role', {role});
+    document.body.innerHTML = '<div class="wrap" style="text-align:center;margin-top:80px"><h1>Запускаю панель клиента</h1><p class="muted">Подождите несколько секунд…</p></div>';
+    setTimeout(() => { location.href = `http://127.0.0.1:${result.port}`; }, 2200);
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
 init();

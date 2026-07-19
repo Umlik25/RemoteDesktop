@@ -14,7 +14,7 @@ a { color: var(--acc); text-decoration: none; }
 .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .topbar {
   display: flex; align-items: center; gap: 14px; padding: 14px 20px;
-  background: var(--bg2); border-bottom: 1px solid var(--line);
+  flex-wrap: wrap; background: var(--bg2); border-bottom: 1px solid var(--line);
 }
 .topbar .logo { font-weight: 700; font-size: 16px; color: var(--acc); }
 .grid { display: grid; gap: 14px; }

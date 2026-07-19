@@ -30,6 +30,24 @@ _VIRTUAL_NIC_MARKERS = (
     "hyper-v", "vmware", "vbox", "bluetooth",
 )
 
+_VM_MARKERS = (
+    "virtual machine", "vmware", "virtualbox", "kvm", "qemu", "xen",
+    "parallels", "bhyve", "hvm domu", "bochs", "hyper-v", "openstack",
+    "amazon ec2", "google compute engine", "digitalocean",
+)
+
+_HYPERVISOR_NAMES = (
+    ("vmware", "VMware"),
+    ("virtualbox", "VirtualBox"),
+    ("microsoft corporation virtual machine", "Hyper-V"),
+    ("hyper-v", "Hyper-V"),
+    ("kvm", "KVM"),
+    ("qemu", "QEMU/KVM"),
+    ("xen", "Xen"),
+    ("parallels", "Parallels"),
+    ("bhyve", "bhyve"),
+)
+
 
 def _run(cmd, timeout=10):
     try:
@@ -51,6 +69,53 @@ def _nvidia_smi(query):
         return None
     out = _run(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"])
     return out or None
+
+
+def classify_machine_environment(*values):
+    """Classify a machine from vendor/model strings without guessing from CPU flags."""
+    description = " ".join(str(value or "") for value in values).strip()
+    lowered = description.lower()
+    is_vm = any(marker in lowered for marker in _VM_MARKERS)
+    hypervisor = None
+    if is_vm:
+        for marker, name in _HYPERVISOR_NAMES:
+            if marker in lowered:
+                hypervisor = name
+                break
+    return {"kind": "vm" if is_vm else "physical",
+            "hypervisor": hypervisor, "description": description[:300]}
+
+
+def get_machine_environment():
+    """Detect whether this agent runs on bare metal or inside a VM."""
+    values = []
+    source = "platform"
+    if IS_WIN:
+        raw = _ps("Get-CimInstance Win32_ComputerSystem | "
+                  "Select-Object Manufacturer,Model | ConvertTo-Json -Compress")
+        try:
+            data = json.loads(raw) if raw else {}
+            values.extend((data.get("Manufacturer"), data.get("Model")))
+            source = "Win32_ComputerSystem"
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+    elif IS_LINUX:
+        virt = _run(["systemd-detect-virt", "--vm"]) if shutil.which("systemd-detect-virt") else ""
+        if virt and virt != "none":
+            values.append(virt)
+            source = "systemd-detect-virt"
+        for path in ("/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name"):
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    values.append(f.read().strip())
+            except OSError:
+                pass
+    elif IS_MAC:
+        values.append(_run(["sysctl", "-n", "hw.model"]))
+    values.extend((platform.system(), platform.release(), platform.machine()))
+    result = classify_machine_environment(*values)
+    result["source"] = source
+    return result
 
 
 def get_gpus():
@@ -242,6 +307,7 @@ def get_static_info():
         "nics": nics,
         "encoders": detect_encoders(gpus),
         "virtualization": get_virtualization(),
+        "environment": get_machine_environment(),
     }
     return _static_cache
 
